@@ -30,7 +30,7 @@ define Package/bpftool/Default
   CATEGORY:=Network
   TITLE:=bpftool - eBPF subsystem utility
   LICENSE:=GPL-2.0-only OR BSD-2-Clause
-  URL:=http://www.kernel.org
+  URL:=http://cdn.kernel.org
   DEPENDS:=+libelf
 endef
 
