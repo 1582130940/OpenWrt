@@ -159,7 +159,6 @@
 };
 
 &tlmm {
-
 	mdio_pins: mdio-state {
 		mdc-pins {
 			pins = "gpio68";

@@ -355,7 +355,6 @@
 	status = "okay";
 };
 
-
 &mdio {
 	status = "okay";
 	pinctrl-0 = <&mdio_pins>;
@@ -382,7 +381,6 @@
 		reg = <28>;
 		reset-gpios = <&tlmm 44 GPIO_ACTIVE_LOW>;
 	};
-
 };
 
 &switch {
