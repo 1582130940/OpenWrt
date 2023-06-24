@@ -1079,6 +1079,7 @@ define Device/dlink_dir-825-b1
   IMAGE/factory.bin = append-kernel | pad-to $$$$(BLOCKSIZE) | append-rootfs | \
 	pad-rootfs | check-size $$$$(FACTORY_SIZE) | pad-to $$$$(FACTORY_SIZE) | \
 	append-string 01AP94-AR7161-RT-080619-00
+  DEFAULT := n
 endef
 TARGET_DEVICES += dlink_dir-825-b1
 
@@ -1877,6 +1878,7 @@ define Device/nec_wg800hp
 	append-rootfs | pad-rootfs | check-size | \
 	xor-image -p 6A57190601121E4C004C1E1201061957 -x | nec-fw LASER_ATERM
   DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers ath10k-firmware-qca9887-ct-full-htt
+  DEFAULT := n
 endef
 TARGET_DEVICES += nec_wg800hp
 
@@ -2701,6 +2703,7 @@ define Device/sitecom_wlr-7100
 	append-rootfs | pad-rootfs | check-size | \
 	senao-header -r 0x222 -p 0x53 -t 2
   IMAGE_SIZE := 7488k
+  DEFAULT := n
 endef
 TARGET_DEVICES += sitecom_wlr-7100
 
@@ -2855,6 +2858,7 @@ define Device/trendnet_tew-673gru
   IMAGE/factory.bin = append-kernel | pad-to $$$$(BLOCKSIZE) | append-rootfs | \
 	pad-rootfs | check-size $$$$(FACTORY_SIZE) | pad-to $$$$(FACTORY_SIZE) | \
 	append-string AP94-AR7161-RT-080619-01
+  DEFAULT := n
 endef
 TARGET_DEVICES += trendnet_tew-673gru
 
