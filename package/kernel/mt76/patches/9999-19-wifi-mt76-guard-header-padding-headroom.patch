@@ -1,0 +1,49 @@
+From 27d4d8316272d141de54062e4958c251b457a42c Mon Sep 17 00:00:00 2001
+From: Chen Minqiang <ptpt52@gmail.com>
+Date: Fri, 13 Feb 2026 07:30:45 +0800
+Subject: [PATCH] mt76: fix skb_under_panic in mt76_insert_hdr_pad
+
+Detected a kernel panic (skb_under_panic) on Xiaomi Mi Router 4A
+Gigabit Edition (MT7621). The crash occurs in mt76_insert_hdr_pad
+when the skb headroom is less than 2 bytes.
+
+[180969.481993] skbuff: skb_under_panic: text:848e1a7c len:66 put:2
+head:84ac1800 data:84ac17fe tail:0x84ac1840 end:0x84ac1b00 dev:phy1-ap0
+
+Root Cause:
+In the TX path, mt76_insert_hdr_pad() is called to ensure 4-byte
+alignment for DMA. If the frame length is not a multiple of 4, it
+unconditionally calls skb_push(skb, 2) to insert padding. If the
+skb was received from a source with zero or insufficient headroom
+(e.g., certain OOT modules like natflow or complex tunnel
+encapsulations), this push operation moves skb->data before
+skb->head, triggering the panic.
+
+Solution:
+Check if the skb has enough headroom before calling skb_push().
+If headroom is insufficient, expand the skb using pskb_expand_head().
+This ensures safe padding insertion even for skbs with tight headroom.
+
+Signed-off-by: Chen Minqiang <ptpt52@gmail.com>
+---
+ mt76.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/mt76.h b/mt76.h
+index 0f31d9034..c4e5e9c69 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1488,6 +1488,13 @@ static inline void mt76_insert_hdr_pad(struct sk_buff *skb)
+ 	if (len % 4 == 0)
+ 		return;
+ 
++	if (unlikely(skb_headroom(skb) < 2)) {
++		if (pskb_expand_head(skb, 2, 0, GFP_ATOMIC)) {
++			pr_err("mt76: failed to expand headroom for padding\n");
++			return;
++		}
++	}
++
+ 	skb_push(skb, 2);
+ 	memmove(skb->data, skb->data + 2, len);
+ 
