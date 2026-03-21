@@ -1,0 +1,22 @@
+From: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Date: Sat, 21 Mar 2026 10:59:37 +0100
+Subject: [PATCH] crypto: inside-secure/eip93: correct the ecb(des-eip93) name
+
+The DES ECB template registers its driver name with the letters of "ecb"
+transposed, so the fallback path and any lookup by driver name never
+match.
+
+Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+@@ -320,7 +320,7 @@
+ 		.ivsize	= 0,
+ 		.base = {
+ 			.cra_name = "ecb(des)",
+-			.cra_driver_name = "ebc(des-eip93)",
++			.cra_driver_name = "ecb(des-eip93)",
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
