@@ -1,0 +1,44 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] net: airoha: never bind host-destined frames into the PPE
+
+The bridge-flow binding path (PPE L2 cache-miss fallback) resolves the
+destination MAC through the bridge FDB and programs a hardware FOE
+entry for it.  It relies only on the bridge FDB returning -EOPNOTSUPP
+for the bridge's own MAC to keep host-bound management traffic in
+software.  That implicit exclusion is fragile: if the router's MAC is
+ever present in the FDB as a regular (non-local) entry, or the packet
+is PACKET_HOST on the raw netdev, LuCI/SSH/SCP traffic to the router
+gets bound into the PPE and black-holed.
+
+Make the exclusion explicit: never prepare a hardware bridge subflow
+for frames whose destination is the local host (PACKET_HOST, or the
+bridge master's own MAC).  Such frames must always be punted to the
+CPU.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1009,6 +1009,19 @@
+ 	if (!master)
+ 		return false;
+ 
++	/* Never bind frames destined to the local host (the router itself)
++	 * into the PPE: management traffic (LuCI/SSH/SCP) must always be
++	 * punted to the CPU.  The bridge FDB happens to report no forward
++	 * path for the bridge's own MAC, but make the exclusion explicit so
++	 * a stray FDB/PPE classification can never offload host-bound flows
++	 * into hardware and black-hole them.
++	 */
++	if (skb->pkt_type == PACKET_HOST ||
++	    ether_addr_equal(eh->h_dest, master->dev_addr)) {
++		dev_put(master);
++		return false;
++	}
++
+ 	rcu_read_lock();
+ 	ctx.dev = master;
+ 	if (is_vlan_dev(skb->dev)) {
