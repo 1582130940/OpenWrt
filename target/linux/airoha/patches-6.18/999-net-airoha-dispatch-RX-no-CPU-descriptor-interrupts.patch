@@ -1,0 +1,66 @@
+From: Vitaliy Sochnev <sochnev.v.74@gmail.com>
+Date: Tue, 18 Aug 2026 21:00:00 +0300
+Subject: [PATCH] net: airoha: dispatch RX no-CPU-descriptor interrupts to NAPI
+
+The QDMA IRQ banks enable the RX no-CPU-descriptor interrupts, but the
+handler only dispatched the RX done bits and NAPI completion only
+re-enabled those. A ring that runs out of descriptors never raises RX
+done again, so it stays dead.
+
+Schedule NAPI for both interrupt sources and re-enable both when NAPI
+completes.
+
+Signed-off-by: Vitaliy Sochnev <sochnev.v.74@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -198,11 +198,12 @@
+ 					bool enable)
+ {
+ 	int i, intr_reg;
+-	u32 mask;
++	u32 irq_id, mask;
+ 
+ 	intr_reg = qid < RX_DONE_HIGH_OFFSET ? QDMA_INT_REG_IDX1 :
+ 					       QDMA_INT_REG_IDX2;
+-	mask = BIT(qid % RX_DONE_HIGH_OFFSET);
++	irq_id = qid % RX_DONE_HIGH_OFFSET;
++	mask = BIT(irq_id) | BIT(irq_id + RX_NO_CPU_DSCP_LOW_OFFSET);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->irq_banks); i++) {
+ 		if (!(BIT(qid) & airoha_qdma_rx_irq_bank_mask(qdma, i)))
+@@ -2119,16 +2120,19 @@
+ 	if (!test_bit(DEV_STATE_INITIALIZED, &qdma->eth->state))
+ 		return IRQ_NONE;
+ 
+-	rx_intr1 = intr[1] & RX_DONE_LOW_INT_MASK;
++	rx_intr1 = intr[1] & (RX_DONE_LOW_INT_MASK | RX_NO_CPU_DSCP_LOW_INT_MASK);
+ 	if (rx_intr1) {
+ 		airoha_qdma_irq_disable(irq_bank, QDMA_INT_REG_IDX1, rx_intr1);
+-		rx_intr_mask |= rx_intr1;
++		rx_intr_mask |= (rx_intr1 & RX_DONE_LOW_INT_MASK) |
++				RX_NO_CPU_DSCP_INT_RX1_MASK(rx_intr1);
+ 	}
+ 
+-	rx_intr2 = intr[2] & RX_DONE_HIGH_INT_MASK;
++	rx_intr2 = intr[2] & (RX_DONE_HIGH_INT_MASK | RX_NO_CPU_DSCP_HIGH_INT_MASK);
+ 	if (rx_intr2) {
+ 		airoha_qdma_irq_disable(irq_bank, QDMA_INT_REG_IDX2, rx_intr2);
+-		rx_intr_mask |= (rx_intr2 << 16);
++		rx_intr_mask |= ((rx_intr2 & RX_DONE_HIGH_INT_MASK) <<
++				 RX_DONE_HIGH_OFFSET) |
++				(rx_intr2 & RX_NO_CPU_DSCP_HIGH_INT_MASK);
+ 	}
+ 
+ 	for (i = 0; rx_intr_mask && i < ARRAY_SIZE(qdma->q_rx); i++) {
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -584,6 +584,8 @@
+ #define INT_RX1_MASK(_n)							\
+ 	((((_n) << RX_NO_CPU_DSCP_LOW_OFFSET) & RX_NO_CPU_DSCP_LOW_INT_MASK) |	\
+ 	 (RX_DONE_LOW_INT_MASK & (_n)))
++#define RX_NO_CPU_DSCP_INT_RX1_MASK(_n)					\
++	(((_n) & RX_NO_CPU_DSCP_LOW_INT_MASK) >> RX_NO_CPU_DSCP_LOW_OFFSET)
+ 
+ /* QDMA_CSR_INT_ENABLE3 */
+ #define RX31_NO_CPU_DSCP_INT_MASK	BIT(31)
