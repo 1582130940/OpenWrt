@@ -1,0 +1,77 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: finish cleanup for truncated TXFREE events
+
+MT7996 firmware can occasionally report a TXFREE MSDU count that extends
+past the event payload. The existing guard returns from
+mt7996_mac_tx_free() as soon as the parser reaches the end of the skb. If
+earlier words in the same event already released tokens, that early return
+skips station polling, queue wakeup, tx worker scheduling and skb
+consumption for the partially built free list.
+
+Keep the malformed event visible with WARN_ON_ONCE(), but jump to the
+normal cleanup tail after the valid prefix has been consumed. Also reject
+events that are too short to contain the TXFREE header before reading
+tx_free[1], and require each parsed dword to be fully present instead of
+only checking that the cursor has not crossed the end pointer.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ mt7996/mac.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1380,21 +1380,24 @@
+ 	if (phy3) {
+ 		mt76_queue_tx_cleanup(dev, phy3->q_tx[MT_TXQ_PSD], false);
+ 		mt76_queue_tx_cleanup(dev, phy3->q_tx[MT_TXQ_BE], false);
+ 	}
+ 
++	if (WARN_ON_ONCE(len < 2 * sizeof(*tx_free)))
++		return;
++
+ 	ver = le32_get_bits(tx_free[1], MT_TXFREE1_VER);
+ 	if (WARN_ON_ONCE(ver < 5))
+ 		return;
+ 
+ 	total = le32_get_bits(tx_free[0], MT_TXFREE0_MSDU_CNT);
+ 	for (cur_info = &tx_free[2]; count < total; cur_info++) {
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)cur_info >= end))
+-			return;
++		if (WARN_ON_ONCE((void *)(cur_info + 1) > end))
++			goto out;
+ 		/* 1'b1: new wcid pair.
+ 		 * 1'b0: msdu_id with the same 'wcid pair' as above.
+ 		 */
+ 		info = le32_to_cpu(*cur_info);
+ 		if (info & MT_TXFREE_INFO_PAIR) {
+@@ -1431,11 +1434,11 @@
+ 				mt76_wcid_add_poll(&dev->mt76,
+ 						   &msta_link->wcid);
+ 			}
+ next:
+ 			/* ver 7 has a new DW with pair = 1, skip it */
+-			if (ver == 7 && ((void *)(cur_info + 1) < end) &&
++			if (ver == 7 && ((void *)(cur_info + 2) <= end) &&
+ 			    (le32_to_cpu(*(cur_info + 1)) & MT_TXFREE_INFO_PAIR))
+ 				cur_info++;
+ 			continue;
+ 		} else if (info & MT_TXFREE_INFO_HEADER) {
+ 			u32 tx_retries = 0, count;
+@@ -1464,10 +1467,11 @@
+ 
+ 			mt7996_txwi_free(dev, txwi, link_sta, wcid,
+ 					 &free_list);
+ 		}
+ 	}
++out:
+ 
+ 	mt7996_mac_sta_poll(dev);
+ 
+ 	if (wake)
+ 		mt76_set_tx_blocked(&dev->mt76, false);
+-- 
+2.51.0
