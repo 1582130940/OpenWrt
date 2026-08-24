@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# Set the bridge-nf call flags when br-lan is created, so bridged IP traffic
+# reaches the netfilter forward chain where nft_flow_offload can bind it to
+# the PPE.
+
+[ "$ACTION" = "add" ] || exit 0
+[ "$DEVICENAME" = "br-lan" ] || exit 0
+
+bridge=/sys/class/net/br-lan/bridge
+[ -d "$bridge" ] || exit 0
+
+echo 1 > "$bridge/nf_call_iptables" 2>/dev/null
+echo 1 > "$bridge/nf_call_ip6tables" 2>/dev/null
+
+exit 0
