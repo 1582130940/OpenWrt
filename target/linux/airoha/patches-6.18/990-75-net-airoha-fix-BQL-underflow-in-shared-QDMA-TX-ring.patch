@@ -1,0 +1,49 @@
+From 6117098309452c641af4458a0f7c02888b026fb6 Mon Sep 17 00:00:00 2001
+From: Lorenzo Bianconi <lorenzo@kernel.org>
+Date: Sat, 20 Jun 2026 17:04:51 +0200
+Subject: [PATCH] net: airoha: fix BQL underflow in shared QDMA TX ring
+
+When multiple netdevs share a QDMA TX ring and one device is stopped,
+netdev_tx_reset_subqueue() zeroes that device's BQL counters while its
+pending skbs remain in the shared HW TX ring. When NAPI later completes
+those skbs via netdev_tx_completed_queue(), the already-zeroed
+dql->num_queued counter underflows.
+
+Fix the issue:
+- Remove netdev_tx_reset_subqueue() from airoha_dev_stop() so pending
+  skbs are completed naturally by NAPI with proper BQL accounting.
+- Rework TX cleanup to disable TX DMA, flush BQL counters, DMA-unmap and
+  free all pending skbs while skb->dev references are still valid. Use a
+  per-queue flushing flag checked under q->lock in both Ethernet and SOE
+  transmit paths to prevent races between teardown and transmit.
+- Move DMA engine start into probe. Split DMA teardown so TX DMA is
+  disabled in TX cleanup and RX DMA in QDMA cleanup.
+- Remove qdma->users since DMA lifetime is now tied to probe/cleanup
+  rather than per-netdev open/stop.
+
+Fixes: a9c2ca61fec7 ("net: airoha: Support multiple net_devices for a single FE GDM port")
+Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20260620-airoha-bql-fixes-v3-1-76b95374e63e@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[Jihong: refresh after local GRO/QDMA/SOE patches and guard SOE xmit]
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3038,6 +3038,12 @@ int airoha_qdma_xmit_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 
+ 	spin_lock_bh(&q->lock);
+ 
++	if (q->flushing) {
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++		return -EBUSY;
++	}
++
+ 	txq = skb_get_tx_queue(netdev, skb);
+ 	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+ 	if (q->queued + nr_frags >= q->ndesc) {
