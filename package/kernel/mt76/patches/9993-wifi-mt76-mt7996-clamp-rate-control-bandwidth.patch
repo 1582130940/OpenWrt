@@ -1,0 +1,44 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 14 Jul 2026 12:30:00 +1100
+Subject: [PATCH] wifi: mt76: mt7996: clamp rate-control bandwidth
+
+When an AP runs a wider channel than a station currently uses, mt7996 can
+pass the BSS bandwidth to firmware rate control through ra->bw. That may let
+firmware select rates wider than the peer's current operating bandwidth.
+
+Clamp the RA bandwidth to the smaller of the BSS channel width and the
+station's current operating bandwidth. Keep the PHY bandwidth in sync and
+leave the operating-mode fields at their default values; forcing those
+VHT-shaped fields for ordinary HE stations can confuse MT7996 firmware rate
+selection.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ mt7996/mcu.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -2753,6 +2753,7 @@
+ 	struct mt76_phy *mphy = mt76_vif_link_phy(&link->mt76);
+ 	struct cfg80211_bitrate_mask *mask = &link->bitrate_mask;
+ 	u32 cap = link_sta->sta->wme ? STA_CAP_WMM : 0;
++	u8 chan_bw, op_bw;
+ 	struct cfg80211_chan_def *chandef;
+ 	struct sta_rec_ra_uni *ra;
+ 	enum nl80211_band band;
+@@ -2773,8 +2774,10 @@
+ 	ra->auto_rate = true;
+ 	ra->phy_mode = mt76_connac_get_phy_mode(mphy, vif, band, link_sta);
+ 	ra->channel = chandef->chan->hw_value;
+-	ra->bw = (link_sta->bandwidth == IEEE80211_STA_RX_BW_320) ?
+-		 CMD_CBW_320MHZ : link_sta->bandwidth;
++	chan_bw = mt76_connac_chan_bw(chandef);
++	op_bw = link_sta->bandwidth == IEEE80211_STA_RX_BW_320 ?
++		CMD_CBW_320MHZ : link_sta->bandwidth;
++	ra->bw = min_t(u8, chan_bw, op_bw);
+ 	ra->phy.bw = ra->bw;
+ 	ra->mmps_mode = mt7996_mcu_get_mmps_mode(link_sta->smps_mode);
+ 
+-- 
+2.51.0
