@@ -294,6 +294,9 @@
 &pcie2 {
 	status = "okay";
 
+	airoha,wait-for-pcie0-perst;
+	airoha,scu = <&scuclk>;
+
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_rst_pins>;
 };
