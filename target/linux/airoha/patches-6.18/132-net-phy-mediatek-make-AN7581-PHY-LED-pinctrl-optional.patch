@@ -1,0 +1,43 @@
+From: 1582130940 <19632674+1582130940@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 17:30:00 +0800
+Subject: [PATCH] net: phy: mediatek: make AN7581 PHY LED pinctrl optional
+
+AN7581 boards can either route the internal PHY LED pins through the PHY
+LED pinctrl state, or expose board LEDs as ordinary GPIO LEDs. Gemtek
+W1700K uses GPIO LEDs for its internal switch ports and does not provide a
+"gbe-led" pinctrl state on the enabled internal PHY nodes.
+
+The AN7581 PHY probe currently unconditionally requests the "gbe-led"
+state, which prints "Failed to setup PHY LED pinctrl" on boards without
+that optional state even though forwarding is unaffected.
+
+Only request the state when the PHY node actually declares pinctrl states.
+Boards that declare the wrong state name still keep the error, matching the
+EVB fix that renamed "led" to "gbe-led".
+
+Signed-off-by: 1582130940 <19632674+1582130940@users.noreply.github.com>
+---
+ drivers/net/phy/mediatek/mtk-ge-soc.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/phy/mediatek/mtk-ge-soc.c
++++ b/drivers/net/phy/mediatek/mtk-ge-soc.c
+@@ -1094,11 +1094,13 @@ static int an7581_phy_probe(struct phy_d
+ 	struct mtk_socphy_priv *priv;
+ 	struct pinctrl *pinctrl;
+ 
+-	/* Toggle pinctrl to enable PHY LED */
+-	pinctrl = devm_pinctrl_get_select(&phydev->mdio.dev, "gbe-led");
+-	if (IS_ERR(pinctrl))
+-		dev_err(&phydev->mdio.bus->dev,
+-			"Failed to setup PHY LED pinctrl\n");
++	if (of_property_present(phydev->mdio.dev.of_node, "pinctrl-names")) {
++		/* Toggle pinctrl to enable PHY LED */
++		pinctrl = devm_pinctrl_get_select(&phydev->mdio.dev, "gbe-led");
++		if (IS_ERR(pinctrl))
++			dev_err(&phydev->mdio.bus->dev,
++				"Failed to setup PHY LED pinctrl\n");
++	}
+ 
+ 	priv = devm_kzalloc(&phydev->mdio.dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
