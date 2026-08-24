@@ -1,0 +1,32 @@
+From: Ryan Chen <rchen14b@gmail.com>
+Date: Sun, 16 Mar 2026 11:30:00 -0500
+Subject: [PATCH] net: expose forward-path helpers for bridge flow offload
+
+Airoha bridge and WLAN PPE offload paths need to reuse the bridge FDB
+lookup from outside bridge core code so that their own forward-path
+resolution sees the same entries.
+
+The forward path walk itself comes from dev_fill_forward_path(), which
+takes a net_device_path_ctx from the caller, so only the FDB lookup still
+has to be exported.
+
+Based on MediaTek SDK bridge flow offload work.
+
+Co-authored-by: Yanghan Ye <yyh94306@gmail.com>
+Signed-off-by: Ryan Chen <rchen14b@gmail.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ net/bridge/br_fdb.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -266,6 +266,7 @@ struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
+ {
+ 	return fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
+ }
++EXPORT_SYMBOL_GPL(br_fdb_find_rcu);
+ 
+ /* When a static FDB entry is added, the mac address from the entry is
+  * added to the bridge private HW address list and all required ports
