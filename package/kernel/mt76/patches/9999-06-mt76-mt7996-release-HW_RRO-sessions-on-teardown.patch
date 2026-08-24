@@ -1,0 +1,86 @@
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Sun, 16 Aug 2026 06:01:01 +0000
+Subject: [PATCH] wifi: mt76: mt7996: release HW_RRO sessions on teardown
+
+Apple/macOS clients may negotiate RX BlockAck sessions on several TIDs.
+When the associated session IDs are only cached in the transient software
+reorder context, MT7996/NPU can retain per-WCID RRO state through station
+teardown. The next association that reuses the WCID then inherits stale
+NPU context and uplink RX no longer reaches the PPE unbind path.
+
+Persist the firmware-assigned session ID in the station link, clear it
+when RX BA stops, and explicitly ask firmware to release that session.
+Continue processing remaining session-status events when one TID is
+already torn down.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+
+---
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 2fce7eb0..ab56b66c 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -2280,12 +2280,20 @@ mt7996_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		mt7996_sta_ba_update(&msta->ba_rx_mask, msta->ba_rx, params,
+ 				     !ret);
+ 		break;
+-	case IEEE80211_AMPDU_RX_STOP:
++	case IEEE80211_AMPDU_RX_STOP: {
++		u16 session_id = msta->deflink.rro_id[tid];
++
++		msta->deflink.rro_id[tid] = 0;
+ 		mt76_rx_aggr_stop(&dev->mt76, &msta->deflink.wcid, tid);
+ 		mt7996_sta_ba_update(&msta->ba_rx_mask, msta->ba_rx, params,
+ 				     false);
+ 		ret = mt7996_mcu_add_rx_ba(dev, params, vif, links, false);
++
++		if (session_id && mt7996_has_hwrro(dev))
++			mt7996_mcu_wed_rro_reset_sessions(dev, session_id);
++
+ 		break;
++	}
+ 	case IEEE80211_AMPDU_TX_OPERATIONAL:
+ 		mtxq->aggr = true;
+ 		mtxq->send_bar = false;
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 77c95ca6..b739de82 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -879,6 +879,7 @@ mt7996_mcu_wed_rro_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 		while (skb->len >= sizeof(*e)) {
+ 			struct mt76_rx_tid *tid;
+ 			struct mt76_wcid *wcid;
++			struct mt7996_sta_link *msta_link;
+ 			u16 idx;
+ 
+ 			e = (void *)skb->data;
+@@ -891,10 +892,15 @@ mt7996_mcu_wed_rro_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 				break;
+ 
+ 			tid = rcu_dereference(wcid->aggr[e->tid]);
+-			if (!tid)
+-				break;
++			if (!tid) {
++				skb_pull(skb, sizeof(*e));
++				continue;
++			}
+ 
+ 			tid->id = le16_to_cpu(e->id);
++			msta_link = container_of(wcid, struct mt7996_sta_link,
++						 wcid);
++			msta_link->rro_id[e->tid] = tid->id;
+ 			skb_pull(skb, sizeof(*e));
+ 		}
+ 		break;
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index f964cdb2..de626993 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -302,6 +302,7 @@ struct mt7996_sta_link {
+ 	unsigned long changed;
+ 
+ 	struct mt76_connac_sta_key_conf bip;
++	u16 rro_id[IEEE80211_NUM_TIDS];
+ 
+ 	struct {
+ 		u8 flowid_mask;
