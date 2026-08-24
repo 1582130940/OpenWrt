@@ -1,0 +1,29 @@
+#!/bin/sh
+
+. /lib/functions/system.sh
+
+uci -q set firewall.@defaults[0].flow_offloading='1'
+uci -q set firewall.@defaults[0].flow_offloading_hw='1'
+uci -q commit firewall
+
+# A LAN with the DHCP server ignored runs as a transit uplink, so leave the
+# firewall stopped instead of forcing it back on.
+if [ "$(uci -q get dhcp.lan.ignore)" = "1" ]; then
+	[ -x /etc/init.d/firewall ] && {
+		/etc/init.d/firewall disable
+		/etc/init.d/firewall stop
+	}
+	exit 0
+fi
+
+# Earlier images disabled the firewall by leaving an overlay whiteout over
+# the ROM startup link. Remove only that whiteout before enabling the service.
+firewall_whiteout=/overlay/upper/etc/rc.d/S19firewall
+[ -c "$firewall_whiteout" ] && rm -f "$firewall_whiteout"
+
+if [ -x /etc/init.d/firewall ]; then
+	/etc/init.d/firewall enable
+	/etc/init.d/firewall restart
+fi
+
+exit 0
