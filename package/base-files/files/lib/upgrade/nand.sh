@@ -454,7 +454,11 @@ nand_do_upgrade() {
 	local cmd="$2"
 
 	sync
-	nand_do_flash_file "$file" "$cmd" && nand_do_upgrade_success
+	if nand_do_flash_file "$file" "$cmd"; then
+		nand_do_upgrade_success
+		return $?
+	fi
+
 	nand_do_upgrade_failed
 }
 
@@ -463,7 +467,9 @@ nand_do_upgrade_success() {
 		echo "sysupgrade successful"
 		umount -a
 		reboot -f
+		return 0
 	fi
+
 	nand_do_upgrade_failed
 }
 
@@ -473,6 +479,7 @@ nand_do_upgrade_failed() {
 	# Should we reboot or bring up some failsafe mode instead?
 	umount -a
 	reboot -f
+	return 1
 }
 
 # Check if passed file is a valid one for NAND sysupgrade.
