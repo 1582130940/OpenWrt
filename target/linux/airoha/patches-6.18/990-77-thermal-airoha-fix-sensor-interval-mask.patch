@@ -1,0 +1,23 @@
+From: Gilly1970 <gilroyscott@hotmail.com>
+Subject: [PATCH] thermal: airoha: fix sensor interval field mask
+
+EN7581_TEMPMONCTL2 programs the filter interval and sensor interval
+through separate fields. The driver used EN7581_FILT_INTERVAL for both
+FIELD_PREP() calls, so the sensor interval value was encoded with the
+wrong mask.
+
+Use EN7581_SEN_INTERVAL for the sensor interval field.
+
+Signed-off-by: Gilly1970 <gilroyscott@hotmail.com>
+---
+--- a/drivers/thermal/airoha_thermal.c
++++ b/drivers/thermal/airoha_thermal.c
+@@ -503,7 +503,7 @@
+ 	 */
+ 	regmap_write(priv->map, EN7581_TEMPMONCTL2,
+ 		     FIELD_PREP(EN7581_FILT_INTERVAL, 1) |
+-		     FIELD_PREP(EN7581_FILT_INTERVAL, 379));
++		     FIELD_PREP(EN7581_SEN_INTERVAL, 379));
+ 
+ 	/* AHB poll is set to 146 * 68.64 = 10.02us */
+ 	regmap_write(priv->map, EN7581_TEMPAHBPOLL,
