@@ -6,9 +6,9 @@ include /lib/upgrade
 
 v "Performing system upgrade..."
 if type 'platform_do_upgrade' >/dev/null 2>/dev/null; then
-	platform_do_upgrade "$IMAGE"
+	platform_do_upgrade "$IMAGE" || exit 1
 else
-	default_do_upgrade "$IMAGE"
+	default_do_upgrade "$IMAGE" || exit 1
 fi
 
 if [ -n "$UPGRADE_BACKUP" ] && type 'platform_copy_config' >/dev/null 2>/dev/null; then
