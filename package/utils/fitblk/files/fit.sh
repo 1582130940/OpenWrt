@@ -43,11 +43,28 @@ export_fitblk_bootdev() {
 	done
 }
 
+fitblk_release_dev() {
+	local dev="${1##*/}"
+	local i
+
+	[ -e "/dev/$dev" ] || return 0
+
+	fitblk "/dev/$dev" >/dev/null 2>&1 || return 1
+
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		[ ! -e "/sys/class/block/$dev" ] && return 0
+		sleep 1
+	done
+
+	echo "fitblk: /dev/$dev still present after release, continuing" >&2
+	return 0
+}
+
 fit_do_upgrade() {
 	export_fitblk_bootdev
 	[ -n "$CI_METHOD" ] || return 1
-	[ -e /dev/fit0 ] && fitblk /dev/fit0
-	[ -e /dev/fitrw ] && fitblk /dev/fitrw
+	fitblk_release_dev /dev/fit0 || return 1
+	fitblk_release_dev /dev/fitrw || return 1
 
 	case "$CI_METHOD" in
 	emmc)
