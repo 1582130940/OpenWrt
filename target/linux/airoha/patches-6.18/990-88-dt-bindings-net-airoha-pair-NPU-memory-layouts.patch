@@ -1,0 +1,55 @@
+From 9f898a30106e8a232586940b6186176fb2f0a056 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 23:00:42 +0800
+Subject: [PATCH 5/8] dt-bindings: net: airoha: pair NPU memory layouts
+
+The memory-region and memory-region-names alternatives must describe the
+same layout. Pair the supported one-, two-, four-, and six-entry forms so
+schema validation rejects mixed counts.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ .../bindings/net/airoha,en7581-npu.yaml       | 30 +++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
+index 252cf07e7..51b1f3313 100644
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
+@@ -110,6 +110,36 @@ properties:
+           - const: ba
+           - const: mbox
+ 
++oneOf:
++  - properties:
++      memory-region:
++        minItems: 1
++        maxItems: 1
++      memory-region-names:
++        minItems: 1
++        maxItems: 1
++  - properties:
++      memory-region:
++        minItems: 2
++        maxItems: 2
++      memory-region-names:
++        minItems: 2
++        maxItems: 2
++  - properties:
++      memory-region:
++        minItems: 4
++        maxItems: 4
++      memory-region-names:
++        minItems: 4
++        maxItems: 4
++  - properties:
++      memory-region:
++        minItems: 6
++        maxItems: 6
++      memory-region-names:
++        minItems: 6
++        maxItems: 6
++
+ required:
+   - compatible
+   - reg
