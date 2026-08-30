@@ -1,0 +1,1211 @@
+From 3bc983cd7bbfe4ce385d40a6bb51d249a40c677c Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 23:57:56 +0800
+Subject: [PATCH 7/8] net: airoha: fence Ethernet DMA before teardown
+
+Stop registered netdevs and NAPI before tearing down shared PPE and QDMA
+state. Keep QDMA descriptors, forwarding buffers and PPE DMA tables explicitly
+owned by the driver so they are released only after the terminal reset fence
+proves the hardware cannot access them.
+
+Escalate failed PPE quiesce to the NPU hard-stop path, assert the Ethernet
+reset lines before freeing shared DMA memory, and quarantine the allocations
+when that fence cannot be verified.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 449 ++++++++++++++++-------
+ drivers/net/ethernet/airoha/airoha_eth.h |  25 +-
+ drivers/net/ethernet/airoha/airoha_ppe.c | 273 ++++++++++++--
+ 3 files changed, 581 insertions(+), 166 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index fbf7a8705..d56d3f1fd 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1384,8 +1384,9 @@ static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
+ 	if (!q->entry)
+ 		return -ENOMEM;
+ 
+-	q->desc = dmam_alloc_coherent(eth->dev, ndesc * sizeof(*q->desc),
+-				      &dma_addr, GFP_KERNEL);
++	q->desc_size = ndesc * sizeof(*q->desc);
++	q->desc = dma_alloc_coherent(eth->dev, q->desc_size, &dma_addr,
++				     GFP_KERNEL);
+ 	if (!q->desc)
+ 		return -ENOMEM;
+ 	q->desc_dma = dma_addr;
+@@ -1418,16 +1419,18 @@ static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
+ 				    AIROHA_SOE_RX_BUF_SIZE_MIN, max_buf_size);
+ 		if (q->rx_coherent) {
+ 			buf_size = (size_t)ndesc * q->buf_size;
++			q->rx_coherent_buf_size = buf_size;
+ 			q->rx_coherent_buf =
+-				dmam_alloc_coherent(eth->dev, buf_size,
+-						    &q->rx_coherent_dma, GFP_KERNEL);
++				dma_alloc_coherent(eth->dev, buf_size,
++						   &q->rx_coherent_dma,
++						   GFP_KERNEL);
+ 			if (!q->rx_coherent_buf)
+ 				return -ENOMEM;
+-			q->rx_coherent_buf_size = buf_size;
+ 		}
+ 	}
+ #endif
+ 	netif_napi_add(eth->napi_dev, &q->napi, airoha_qdma_rx_napi_poll);
++	q->napi_added = true;
+ 
+ 	airoha_qdma_wr(qdma, REG_RX_RING_BASE(qid), q->desc_dma);
+ 	airoha_qdma_rmw(qdma, REG_RX_RING_SIZE(qid), RX_RING_SIZE_MASK,
+@@ -1460,7 +1463,6 @@ static void airoha_qdma_cleanup_rx_queue(struct airoha_queue *q)
+ {
+ 	struct airoha_qdma *qdma = q->qdma;
+ 	struct airoha_eth *eth = qdma->eth;
+-	int qid = q - &qdma->q_rx[0];
+ 
+ 	while (q->queued) {
+ 		struct airoha_queue_entry *e = &q->entry[q->tail];
+@@ -1487,14 +1489,11 @@ static void airoha_qdma_cleanup_rx_queue(struct airoha_queue *q)
+ 		q->queued--;
+ 	}
+ 
++	if (q->skb) {
++		dev_kfree_skb_any(q->skb);
++		q->skb = NULL;
++	}
+ 	q->head = q->tail;
+-	/* Set RX_DMA_IDX to RX_CPU_IDX to notify the hw the QDMA RX ring is
+-	 * empty.
+-	 */
+-	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
+-			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
+-	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
+-			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->tail));
+ }
+ 
+ static int airoha_qdma_init_rx(struct airoha_qdma *qdma)
+@@ -1719,10 +1718,12 @@ static int airoha_qdma_init_tx_queue(struct airoha_queue *q,
+ 	if (!q->entry)
+ 		return -ENOMEM;
+ 
+-	q->desc = dmam_alloc_coherent(eth->dev, size * sizeof(*q->desc),
+-				      &dma_addr, GFP_KERNEL);
++	q->desc_size = size * sizeof(*q->desc);
++	q->desc = dma_alloc_coherent(eth->dev, q->desc_size, &dma_addr,
++				     GFP_KERNEL);
+ 	if (!q->desc)
+ 		return -ENOMEM;
++	q->desc_dma = dma_addr;
+ 
+ 	for (i = 0; i < size; i++) {
+ 		u32 val = FIELD_PREP(QDMA_DESC_DONE_MASK, 1);
+@@ -1752,17 +1753,19 @@ static int airoha_qdma_tx_irq_init(struct airoha_tx_irq_queue *irq_q,
+ 	struct airoha_eth *eth = qdma->eth;
+ 	dma_addr_t dma_addr;
+ 
+-	irq_q->q = dmam_alloc_coherent(eth->dev, size * sizeof(u32),
+-				       &dma_addr, GFP_KERNEL);
++	irq_q->size = size;
++	irq_q->q = dma_alloc_coherent(eth->dev, size * sizeof(u32),
++				      &dma_addr, GFP_KERNEL);
+ 	if (!irq_q->q)
+ 		return -ENOMEM;
+ 
+ 	memset(irq_q->q, 0xff, size * sizeof(u32));
+-	irq_q->size = size;
++	irq_q->dma_addr = dma_addr;
+ 	irq_q->qdma = qdma;
+ 
+ 	netif_napi_add_tx(eth->napi_dev, &irq_q->napi,
+ 			  airoha_qdma_tx_napi_poll);
++	irq_q->napi_added = true;
+ 
+ 	airoha_qdma_wr(qdma, REG_TX_IRQ_BASE(id), dma_addr);
+ 	airoha_qdma_rmw(qdma, REG_TX_IRQ_CFG(id), TX_IRQ_DEPTH_MASK,
+@@ -1794,22 +1797,12 @@ static int airoha_qdma_init_tx(struct airoha_qdma *qdma)
+ 	return 0;
+ }
+ 
+-static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
++static void airoha_qdma_release_tx(struct airoha_qdma *qdma)
+ {
+-	u32 status;
+ 	int i;
+ 
+-	airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
+-			  GLOBAL_CFG_TX_DMA_EN_MASK);
+-	if (read_poll_timeout(airoha_qdma_rr, status,
+-			      !(status & GLOBAL_CFG_TX_DMA_BUSY_MASK),
+-			      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
+-			      qdma, REG_QDMA_GLOBAL_CFG))
+-		dev_warn(qdma->eth->dev, "QDMA TX DMA busy timeout\n");
+-
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+ 		struct airoha_queue *q = &qdma->q_tx[i];
+-		u16 index = 0;
+ 		int j;
+ 
+ 		if (!q->ndesc)
+@@ -1849,18 +1842,6 @@ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ 			q->queued--;
+ 		}
+ 
+-		if (!list_empty(&q->tx_list)) {
+-			struct airoha_queue_entry *e;
+-
+-			e = list_first_entry(&q->tx_list,
+-					     struct airoha_queue_entry, list);
+-			index = e - q->entry;
+-		}
+-		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(i), TX_RING_CPU_IDX_MASK,
+-				FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
+-		airoha_qdma_rmw(qdma, REG_TX_DMA_IDX(i), TX_RING_DMA_IDX_MASK,
+-				FIELD_PREP(TX_RING_DMA_IDX_MASK, index));
+-
+ 		spin_unlock_irq(&q->lock);
+ 	}
+ }
+@@ -1870,6 +1851,7 @@ static int airoha_qdma_init_hfwd_queues(struct airoha_qdma *qdma)
+ 	int size, index, num_desc = HW_DSCP_NUM;
+ 	struct airoha_eth *eth = qdma->eth;
+ 	int id = qdma - &eth->qdma[0];
++	u64 dma_limit = dma_get_mask(eth->dev);
+ 	u32 status, buf_size;
+ 	dma_addr_t dma_addr;
+ 	const char *name;
+@@ -1884,6 +1866,7 @@ static int airoha_qdma_init_hfwd_queues(struct airoha_qdma *qdma)
+ 	if (index >= 0) {
+ 		struct reserved_mem *rmem;
+ 		struct device_node *np;
++		u64 count;
+ 
+ 		/* Consume reserved memory for hw forwarding buffers queue if
+ 		 * available in the DTS
+@@ -1897,24 +1880,48 @@ static int airoha_qdma_init_hfwd_queues(struct airoha_qdma *qdma)
+ 		of_node_put(np);
+ 		if (!rmem)
+ 			return -ENODEV;
++		if (!rmem->size)
++			return -EINVAL;
+ 
+-		dma_addr = rmem->base;
+-		/* Compute the number of hw descriptors according to the
+-		 * reserved memory size and the payload buffer size
+-		 */
+-		num_desc = div_u64(rmem->size, buf_size);
++		count = div_u64(rmem->size, buf_size);
++		if (!count || count > FIELD_MAX(HW_FWD_DESC_NUM_MASK))
++			return -ERANGE;
++		num_desc = count;
++
++		qdma->hfwd_buf_size = rmem->size;
++		qdma->hfwd_buf_dma =
++			dma_map_resource(eth->dev, rmem->base, rmem->size,
++					 DMA_BIDIRECTIONAL, 0);
++		if (dma_mapping_error(eth->dev, qdma->hfwd_buf_dma))
++			return -EIO;
++		qdma->hfwd_buf_resource_mapped = true;
++		dma_addr = qdma->hfwd_buf_dma;
++		if (eth->dev->bus_dma_limit)
++			dma_limit = min(dma_limit, eth->dev->bus_dma_limit);
++		if (dma_addr > dma_limit ||
++		    rmem->size - 1 > dma_limit - dma_addr)
++			return -ERANGE;
+ 	} else {
+ 		size = buf_size * num_desc;
+-		if (!dmam_alloc_coherent(eth->dev, size, &dma_addr,
+-					 GFP_KERNEL))
++		qdma->hfwd_buf_size = size;
++		qdma->hfwd_buf =
++			dma_alloc_coherent(eth->dev, size,
++					   &qdma->hfwd_buf_dma, GFP_KERNEL);
++		if (!qdma->hfwd_buf)
+ 			return -ENOMEM;
++		dma_addr = qdma->hfwd_buf_dma;
+ 	}
+ 
+ 	airoha_qdma_wr(qdma, REG_FWD_BUF_BASE, dma_addr);
+ 
+ 	size = num_desc * sizeof(struct airoha_qdma_fwd_desc);
+-	if (!dmam_alloc_coherent(eth->dev, size, &dma_addr, GFP_KERNEL))
++	qdma->hfwd_desc_size = size;
++	qdma->hfwd_desc =
++		dma_alloc_coherent(eth->dev, size, &qdma->hfwd_desc_dma,
++				   GFP_KERNEL);
++	if (!qdma->hfwd_desc)
+ 		return -ENOMEM;
++	dma_addr = qdma->hfwd_desc_dma;
+ 
+ 	airoha_qdma_wr(qdma, REG_FWD_DSCP_BASE, dma_addr);
+ 	/* QDMA0: 2KB. QDMA1: 1KB */
+@@ -2185,45 +2192,164 @@ static int airoha_qdma_init(struct platform_device *pdev,
+ 	return airoha_qdma_hw_init(qdma);
+ }
+ 
+-static void airoha_qdma_cleanup(struct airoha_qdma *qdma)
++static void airoha_qdma_release_dma(void *data)
+ {
+-	int i;
++	struct airoha_eth *eth = data;
++	int i, j;
+ 
+-	if (test_bit(DEV_STATE_INITIALIZED, &qdma->eth->state)) {
+-		u32 status;
++	if (!READ_ONCE(eth->qdma_dma_quiesced)) {
++		dev_crit(eth->dev,
++			 "retaining QDMA DMA because reset fence failed\n");
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++		struct airoha_qdma *qdma = &eth->qdma[i];
++
++		for (j = 0; j < ARRAY_SIZE(qdma->q_rx); j++) {
++			struct airoha_queue *q = &qdma->q_rx[j];
++
++			if (q->rx_coherent_buf) {
++				dma_free_coherent(eth->dev,
++						  q->rx_coherent_buf_size,
++						  q->rx_coherent_buf,
++						  q->rx_coherent_dma);
++				q->rx_coherent_buf = NULL;
++			}
++			if (q->desc) {
++				dma_free_coherent(eth->dev, q->desc_size,
++						  q->desc, q->desc_dma);
++				q->desc = NULL;
++			}
++		}
++
++		for (j = 0; j < ARRAY_SIZE(qdma->q_tx); j++) {
++			struct airoha_queue *q = &qdma->q_tx[j];
++
++			if (!q->desc)
++				continue;
++
++			dma_free_coherent(eth->dev, q->desc_size, q->desc,
++					  q->desc_dma);
++			q->desc = NULL;
++		}
++
++		for (j = 0; j < ARRAY_SIZE(qdma->q_tx_irq); j++) {
++			struct airoha_tx_irq_queue *irq_q = &qdma->q_tx_irq[j];
++
++			if (!irq_q->q)
++				continue;
++
++			dma_free_coherent(eth->dev, irq_q->size * sizeof(u32),
++					  irq_q->q, irq_q->dma_addr);
++			irq_q->q = NULL;
++		}
+ 
+-		airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
+-				  GLOBAL_CFG_RX_DMA_EN_MASK);
+-		if (read_poll_timeout(airoha_qdma_rr, status,
+-				      !(status & GLOBAL_CFG_RX_DMA_BUSY_MASK),
+-				      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
+-				      qdma, REG_QDMA_GLOBAL_CFG))
+-			dev_warn(qdma->eth->dev, "QDMA RX DMA busy timeout\n");
++		if (qdma->hfwd_desc) {
++			dma_free_coherent(eth->dev, qdma->hfwd_desc_size,
++					  qdma->hfwd_desc,
++					  qdma->hfwd_desc_dma);
++			qdma->hfwd_desc = NULL;
++		}
++		if (qdma->hfwd_buf_resource_mapped) {
++			dma_unmap_resource(eth->dev, qdma->hfwd_buf_dma,
++					   qdma->hfwd_buf_size,
++					   DMA_BIDIRECTIONAL, 0);
++			qdma->hfwd_buf_resource_mapped = false;
++		} else if (qdma->hfwd_buf) {
++			dma_free_coherent(eth->dev, qdma->hfwd_buf_size,
++					  qdma->hfwd_buf,
++					  qdma->hfwd_buf_dma);
++			qdma->hfwd_buf = NULL;
++		}
+ 	}
++}
++
++static void
++airoha_qdma_release(struct airoha_eth *eth, struct airoha_qdma *qdma,
++		    bool release_dma)
++{
++	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+-		if (!qdma->q_rx[i].ndesc)
++		struct airoha_queue *q = &qdma->q_rx[i];
++
++		if (q->napi_added) {
++			netif_napi_del(&q->napi);
++			q->napi_added = false;
++		}
++		if (!release_dma)
+ 			continue;
+ 
+-		netif_napi_del(&qdma->q_rx[i].napi);
+-		airoha_qdma_cleanup_rx_queue(&qdma->q_rx[i]);
+-		if (qdma->q_rx[i].page_pool) {
+-			page_pool_destroy(qdma->q_rx[i].page_pool);
+-			qdma->q_rx[i].page_pool = NULL;
++		if (q->ndesc)
++			airoha_qdma_cleanup_rx_queue(q);
++		if (q->page_pool) {
++			page_pool_destroy(q->page_pool);
++			q->page_pool = NULL;
+ 		}
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
+-		if (!qdma->q_tx_irq[i].size)
++		struct airoha_tx_irq_queue *irq_q = &qdma->q_tx_irq[i];
++
++		if (!irq_q->napi_added)
+ 			continue;
+ 
+-		netif_napi_del(&qdma->q_tx_irq[i].napi);
++		netif_napi_del(&irq_q->napi);
++		irq_q->napi_added = false;
++	}
++}
++
++static bool airoha_eth_terminal_reset(struct airoha_eth *eth)
++{
++	u32 status;
++	int err, i;
++
++	if (test_bit(DEV_STATE_INITIALIZED, &eth->state)) {
++		for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
++			airoha_qdma_clear(&eth->qdma[i], REG_QDMA_GLOBAL_CFG,
++					  GLOBAL_CFG_TX_DMA_EN_MASK |
++					  GLOBAL_CFG_RX_DMA_EN_MASK);
++
++		for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++			err = read_poll_timeout(airoha_qdma_rr, status,
++						!(status &
++						  (GLOBAL_CFG_TX_DMA_BUSY_MASK |
++						   GLOBAL_CFG_RX_DMA_BUSY_MASK)),
++						USEC_PER_MSEC, 50 * USEC_PER_MSEC,
++						true, &eth->qdma[i],
++						REG_QDMA_GLOBAL_CFG);
++			if (err)
++				dev_warn(eth->dev,
++					 "QDMA%d DMA busy, forcing reset\n", i);
++		}
++	}
++
++	err = reset_control_bulk_assert(ARRAY_SIZE(eth->rsts), eth->rsts);
++	if (err) {
++		dev_crit(eth->dev, "failed to assert Ethernet resets: %d\n",
++			 err);
++		return false;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(eth->rsts); i++) {
++		err = reset_control_status(eth->rsts[i].rstc);
++		if (err <= 0) {
++			dev_crit(eth->dev,
++				 "Ethernet reset %s is not asserted: %d\n",
++				 eth->rsts[i].id, err);
++			return false;
++		}
+ 	}
++
++	WRITE_ONCE(eth->qdma_dma_quiesced, true);
++	return true;
+ }
+ 
+ static int airoha_hw_init(struct platform_device *pdev,
+ 			  struct airoha_eth *eth)
+ {
++	bool ppe_quiesced = true, reset_fenced;
+ 	int err, i;
+ 
+ 	/* disable xsi */
+@@ -2243,50 +2369,85 @@ static int airoha_hw_init(struct platform_device *pdev,
+ 	err = reset_control_bulk_deassert(ARRAY_SIZE(eth->rsts), eth->rsts);
+ 	if (err)
+ 		return err;
++	WRITE_ONCE(eth->qdma_dma_quiesced, false);
+ 
+ 	msleep(20);
+ 	err = airoha_fe_init(eth);
+ 	if (err)
+-		return err;
++		goto error;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+ 		err = airoha_qdma_init(pdev, eth, &eth->qdma[i]);
+ 		if (err)
+ 			goto error;
+ 	}
++	err = devm_add_action_or_reset(eth->dev, airoha_qdma_release_dma,
++				       eth);
++	if (err)
++		goto error;
++	eth->qdma_dma_action_registered = true;
+ 
+ 	err = airoha_ppe_init(eth);
+ 	if (err)
+ 		goto error;
++	set_bit(DEV_STATE_PPE_INITIALIZED, &eth->state);
+ 
+ 	set_bit(DEV_STATE_INITIALIZED, &eth->state);
+ 
+ 	return 0;
+ error:
+-	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+-		airoha_qdma_cleanup(&eth->qdma[i]);
++	if (test_bit(DEV_STATE_PPE_INITIALIZED, &eth->state))
++		ppe_quiesced = airoha_ppe_deinit(eth);
++	reset_fenced = airoha_eth_terminal_reset(eth);
++	WRITE_ONCE(eth->qdma_dma_quiesced, ppe_quiesced && reset_fenced);
++	if (READ_ONCE(eth->qdma_dma_quiesced)) {
++		for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++			airoha_qdma_release_tx(&eth->qdma[i]);
++			airoha_qdma_release(eth, &eth->qdma[i], true);
++		}
++		if (!eth->qdma_dma_action_registered)
++			airoha_qdma_release_dma(eth);
++	} else {
++		for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
++			airoha_qdma_release(eth, &eth->qdma[i], false);
++	}
+ 
+ 	return err;
+ }
+ 
+-static void airoha_hw_cleanup(struct airoha_eth *eth)
++static bool airoha_hw_cleanup(struct airoha_eth *eth)
+ {
++	bool ppe_quiesced = true, release_dma, reset_fenced;
+ 	int i;
+ 
++	if (test_bit(DEV_STATE_PPE_INITIALIZED, &eth->state))
++		ppe_quiesced = airoha_ppe_deinit(eth);
++	reset_fenced = airoha_eth_terminal_reset(eth);
++	release_dma = ppe_quiesced && reset_fenced;
++	WRITE_ONCE(eth->qdma_dma_quiesced, release_dma);
++
++	if (release_dma) {
++		for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
++			airoha_qdma_release_tx(&eth->qdma[i]);
++	}
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+-		airoha_qdma_cleanup(&eth->qdma[i]);
+-	airoha_ppe_deinit(eth);
++		airoha_qdma_release(eth, &eth->qdma[i], release_dma);
++	clear_bit(DEV_STATE_INITIALIZED, &eth->state);
++
++	return release_dma;
+ }
+ 
+ static void airoha_qdma_start_napi(struct airoha_qdma *qdma)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++)
+-		napi_enable(&qdma->q_tx_irq[i].napi);
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
++		if (qdma->q_tx_irq[i].napi_added)
++			napi_enable(&qdma->q_tx_irq[i].napi);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+-		if (!qdma->q_rx[i].ndesc)
++		if (!qdma->q_rx[i].napi_added)
+ 			continue;
+ 
+ 		napi_enable(&qdma->q_rx[i].napi);
+@@ -2297,11 +2458,13 @@ static void airoha_qdma_stop_napi(struct airoha_qdma *qdma)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++)
+-		napi_disable(&qdma->q_tx_irq[i].napi);
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
++		if (qdma->q_tx_irq[i].napi_added)
++			napi_disable(&qdma->q_tx_irq[i].napi);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+-		if (!qdma->q_rx[i].ndesc)
++		if (!qdma->q_rx[i].napi_added)
+ 			continue;
+ 
+ 		napi_disable(&qdma->q_rx[i].napi);
+@@ -4574,11 +4737,66 @@ static int airoha_register_gdm_devices(struct airoha_eth *eth)
+ 	return 0;
+ }
+ 
++static void airoha_stop_gdm_devices(struct airoha_eth *eth)
++{
++	int i;
++
++	clear_bit(DEV_STATE_REGISTERED, &eth->state);
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++		int j;
++
++		if (!port)
++			continue;
++
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			struct airoha_gdm_dev *dev = port->devs[j];
++			struct net_device *netdev;
++
++			if (!dev)
++				continue;
++
++			netdev = netdev_from_priv(dev);
++			if (netdev->reg_state == NETREG_REGISTERED)
++				unregister_netdev(netdev);
++		}
++	}
++}
++
++static void airoha_release_gdm_devices(struct airoha_eth *eth)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++		int j;
++
++		if (!port)
++			continue;
++
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			struct airoha_gdm_dev *dev = port->devs[j];
++			struct net_device *netdev;
++
++			if (!dev)
++				continue;
++
++			netdev = netdev_from_priv(dev);
++			airoha_soe_teardown_netdev(netdev);
++			if (dev->phylink)
++				phylink_destroy(dev->phylink);
++			of_node_put(netdev->dev.of_node);
++		}
++		airoha_metadata_dst_free(port);
++	}
++}
++
+ static int airoha_probe(struct platform_device *pdev)
+ {
+ 	struct reset_control_bulk_data *xsi_rsts;
+ 	struct device_node *np;
+ 	struct airoha_eth *eth;
++	bool cleanup_safe;
+ 	int i, err;
+ 
+ 	eth = devm_kzalloc(&pdev->dev, sizeof(*eth), GFP_KERNEL);
+@@ -4590,6 +4808,7 @@ static int airoha_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 
+ 	eth->dev = &pdev->dev;
++	WRITE_ONCE(eth->qdma_dma_quiesced, true);
+ 
+ 	err = dma_set_mask_and_coherent(eth->dev, DMA_BIT_MASK(32));
+ 	if (err) {
+@@ -4676,36 +4895,14 @@ static int airoha_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ error_napi_stop:
+-	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++	airoha_stop_gdm_devices(eth);
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_stop_napi(&eth->qdma[i]);
+-		airoha_qdma_tx_cleanup(&eth->qdma[i]);
+-	}
+-
+-	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
+-		struct airoha_gdm_port *port = eth->ports[i];
+-		int j;
+-
+-		if (!port)
+-			continue;
+-
+-		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
+-			struct airoha_gdm_dev *dev = port->devs[j];
+-			struct net_device *netdev;
+-
+-			if (!dev)
+-				continue;
+-
+-			netdev = netdev_from_priv(dev);
+-			if (netdev->reg_state == NETREG_REGISTERED)
+-				unregister_netdev(netdev);
+-			airoha_soe_teardown_netdev(netdev);
+-			if (dev->phylink)
+-				phylink_destroy(dev->phylink);
+-			of_node_put(netdev->dev.of_node);
+-		}
+-		airoha_metadata_dst_free(port);
+-	}
+-	airoha_hw_cleanup(eth);
++	cleanup_safe = airoha_hw_cleanup(eth);
++	airoha_release_gdm_devices(eth);
++	if (!cleanup_safe)
++		dev_crit(eth->dev,
++			 "retaining Ethernet DMA after terminal fence failure\n");
+ error_netdev_free:
+ 	airoha_soe_deinit(eth);
+ 	free_netdev(eth->napi_dev);
+@@ -4717,36 +4914,18 @@ static int airoha_probe(struct platform_device *pdev)
+ static void airoha_remove(struct platform_device *pdev)
+ {
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
++	bool cleanup_safe;
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++	airoha_stop_gdm_devices(eth);
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_stop_napi(&eth->qdma[i]);
+-		airoha_qdma_tx_cleanup(&eth->qdma[i]);
+-	}
+-
+-	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
+-		struct airoha_gdm_port *port = eth->ports[i];
+-		int j;
+-
+-		if (!port)
+-			continue;
+-
+-		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
+-			struct airoha_gdm_dev *dev = port->devs[j];
+-			struct net_device *netdev;
+-
+-			if (!dev)
+-				continue;
+-
+-			netdev = netdev_from_priv(dev);
+-			unregister_netdev(netdev);
+-			airoha_soe_teardown_netdev(netdev);
+-			phylink_destroy(dev->phylink);
+-			of_node_put(netdev->dev.of_node);
+-		}
+-		airoha_metadata_dst_free(port);
++	cleanup_safe = airoha_hw_cleanup(eth);
++	airoha_release_gdm_devices(eth);
++	if (!cleanup_safe) {
++		dev_crit(eth->dev,
++			 "retaining Ethernet DMA after terminal fence failure\n");
+ 	}
+-	airoha_hw_cleanup(eth);
+ 	airoha_soe_deinit(eth);
+ 
+ 	free_netdev(eth->napi_dev);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index f6b3ad18d..b4cd87028 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -24,6 +24,7 @@ struct airoha_soe;
+ #define AIROHA_MAX_NUM_IRQ_BANKS	4
+ #define AIROHA_MAX_DSA_PORTS		7
+ #define AIROHA_MAX_NUM_RSTS		3
++#define AIROHA_NPU_DMA_ADDR_MAX		0xbfffffffULL
+ #define AIROHA_MAX_MTU			9220
+ #define AIROHA_MAX_RX_SIZE		16128
+ #define AIROHA_MAX_PACKET_SIZE		2048
+@@ -109,6 +110,7 @@ enum {
+ enum {
+ 	DEV_STATE_INITIALIZED,
+ 	DEV_STATE_REGISTERED,
++	DEV_STATE_PPE_INITIALIZED,
+ };
+ 
+ enum {
+@@ -224,8 +226,8 @@ struct airoha_queue {
+ 	spinlock_t lock;
+ 	struct airoha_queue_entry *entry;
+ 	struct airoha_qdma_desc *desc;
+-	/* Preserved for RX ring reprogramming; dmam_alloc_coherent() owns it. */
+ 	dma_addr_t desc_dma;
++	size_t desc_size;
+ 	u16 head;
+ 	u16 tail;
+ 
+@@ -237,6 +239,7 @@ struct airoha_queue {
+ 	int buf_size;
+ 	bool txq_stopped;
+ 	bool flushing;
++	bool napi_added;
+ 	bool rx_coherent;
+ 	bool rx_drop_chain;
+ 	void *rx_coherent_buf;
+@@ -262,6 +265,8 @@ struct airoha_tx_irq_queue {
+ 
+ 	int size;
+ 	u32 *q;
++	dma_addr_t dma_addr;
++	bool napi_added;
+ };
+ 
+ struct airoha_hw_stats {
+@@ -621,6 +626,13 @@ struct airoha_qdma {
+ 
+ 	struct airoha_queue q_tx[AIROHA_NUM_TX_RING];
+ 	struct airoha_queue q_rx[AIROHA_NUM_RX_RING];
++	void *hfwd_buf;
++	dma_addr_t hfwd_buf_dma;
++	size_t hfwd_buf_size;
++	bool hfwd_buf_resource_mapped;
++	void *hfwd_desc;
++	dma_addr_t hfwd_desc_dma;
++	size_t hfwd_desc_size;
+ 
+ 	DECLARE_BITMAP(qos_channel_map, AIROHA_NUM_QOS_CHANNELS);
+ };
+@@ -677,6 +689,7 @@ struct airoha_ppe {
+ 
+ 	void *foe;
+ 	dma_addr_t foe_dma;
++	size_t foe_size;
+ 
+ 	struct rhashtable l2_flows;
+ 
+@@ -688,7 +701,13 @@ struct airoha_ppe {
+ 	struct notifier_block switchdev_notifier;
+ 
+ 	struct airoha_foe_stats *foe_stats;
++	struct device *foe_stats_dev;
+ 	dma_addr_t foe_stats_dma;
++	size_t foe_stats_size;
++
++	/* False while firmware or FE may still access the DMA tables. */
++	bool dma_quiesced;
++	struct airoha_npu *quarantine_npu;
+ 
+ 	struct dentry *debugfs_dir;
+ };
+@@ -732,6 +751,8 @@ struct airoha_eth {
+ 	struct net_device *napi_dev;
+ 
+ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
++	bool qdma_dma_quiesced;
++	bool qdma_dma_action_registered;
+ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
+ 	struct airoha_soe *soe;
+ };
+@@ -827,7 +848,7 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+-void airoha_ppe_deinit(struct airoha_eth *eth);
++bool airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 68a1b85c2..fff4e1ba6 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2567,30 +2567,183 @@ static int airoha_ppe_wait_for_npu_init(struct airoha_eth *eth)
+ 	return err;
+ }
+ 
++static int airoha_ppe_npu_deinit_retry(struct airoha_npu *npu)
++{
++	int err;
++
++	err = npu->ops.ppe_deinit(npu);
++	if (err == -EAGAIN) {
++		err = airoha_npu_wait_recovery(npu);
++		if (err && err != -ETIMEDOUT)
++			return err;
++
++		if (!err)
++			err = npu->ops.ppe_deinit(npu);
++	}
++
++	if (err != -ETIMEDOUT)
++		return err;
++
++	err = airoha_npu_recover_mailbox(npu);
++	if (err)
++		return err;
++
++	return npu->ops.ppe_deinit(npu);
++}
++
++static int airoha_ppe_npu_quiesce(struct airoha_eth *eth,
++				  struct airoha_npu *npu);
++
++static int airoha_ppe_retry_quarantined_npu(struct airoha_ppe *ppe)
++{
++	struct airoha_npu *npu = ppe->quarantine_npu;
++	int err;
++
++	if (!npu)
++		return 0;
++
++	err = airoha_ppe_npu_quiesce(ppe->eth, npu);
++	if (err)
++		return err;
++
++	ppe->quarantine_npu = NULL;
++	WRITE_ONCE(ppe->dma_quiesced, true);
++	airoha_npu_put(npu);
++
++	return 0;
++}
++
++static int airoha_ppe_wait_hw_stopped(struct airoha_eth *eth)
++{
++	u32 val;
++	int err, i;
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		err = read_poll_timeout(airoha_fe_rr, val,
++					!(val & (PPE_GLO_CFG_EN_MASK |
++						 PPE_GLO_CFG_BUSY_MASK)), 10,
++					100 * USEC_PER_MSEC, false, eth,
++					REG_PPE_GLO_CFG(i));
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int airoha_ppe_npu_quiesce(struct airoha_eth *eth,
++				  struct airoha_npu *npu)
++{
++	int err;
++
++	err = airoha_ppe_npu_deinit_retry(npu);
++	return err ? err : airoha_ppe_wait_hw_stopped(eth);
++}
++
++static int airoha_ppe_terminal_fence(struct airoha_eth *eth,
++				     struct airoha_npu *npu)
++{
++	int err, i, status;
++
++	err = airoha_npu_hard_stop(npu);
++	if (err)
++		return err;
++
++	for (i = 0; i < eth->soc->num_ppe; i++)
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(i), PPE_GLO_CFG_EN_MASK);
++
++	err = airoha_ppe_wait_hw_stopped(eth);
++	if (!err)
++		return 0;
++
++	err = reset_control_assert(eth->rsts[0].rstc);
++	if (err)
++		return err;
++
++	status = reset_control_status(eth->rsts[0].rstc);
++	if (status < 0)
++		return status;
++
++	return status ? 0 : -EIO;
++}
++
++static int airoha_ppe_stats_alloc(struct airoha_ppe *ppe,
++				  struct airoha_npu *npu, u32 num_entries)
++{
++	struct device *dev;
++	int err;
++
++	if (!num_entries || ppe->foe_stats)
++		return 0;
++
++	ppe->foe_stats_size = num_entries * sizeof(*ppe->foe_stats);
++	dev = get_device(npu->dev);
++	if (!dev)
++		return -ENODEV;
++
++	ppe->foe_stats =
++		dma_alloc_coherent(dev, ppe->foe_stats_size,
++				   &ppe->foe_stats_dma, GFP_KERNEL);
++	if (!ppe->foe_stats) {
++		err = -ENOMEM;
++		goto error_put_device;
++	}
++
++	if (ppe->foe_stats_dma > AIROHA_NPU_DMA_ADDR_MAX ||
++	    ppe->foe_stats_size - 1 >
++	    AIROHA_NPU_DMA_ADDR_MAX - ppe->foe_stats_dma)
++		goto error_dma_range;
++
++	ppe->foe_stats_dev = dev;
++	return 0;
++
++error_dma_range:
++	err = -ERANGE;
++	dma_free_coherent(dev, ppe->foe_stats_size, ppe->foe_stats,
++			  ppe->foe_stats_dma);
++	ppe->foe_stats = NULL;
++error_put_device:
++	put_device(dev);
++
++	return err;
++}
++
+ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ {
+-	struct airoha_npu *npu = airoha_ppe_npu_get(eth);
+ 	struct airoha_ppe *ppe = eth->ppe;
+-	int err, ppe_num_stats_entries;
++	struct airoha_npu *npu;
++	int deinit_err, err, ppe_num_stats_entries;
++
++	err = airoha_ppe_retry_quarantined_npu(ppe);
++	if (err)
++		return err;
++
++	npu = airoha_ppe_npu_get(eth);
+ 
+ 	if (IS_ERR(npu))
+ 		return PTR_ERR(npu);
+ 
++	/* A timed-out init may have been consumed by firmware. */
++	WRITE_ONCE(ppe->dma_quiesced, false);
+ 	err = npu->ops.ppe_init(npu);
+ 	if (err)
+-		goto error_npu_put;
++		goto error_npu_deinit;
+ 
+ 	/* Wait for NPU PPE configuration to complete */
+ 	err = airoha_ppe_wait_for_npu_init(eth);
+ 	if (err)
+-		goto error_npu_put;
++		goto error_npu_deinit;
+ 
+ 	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+ 	if (ppe_num_stats_entries > 0) {
++		err = airoha_ppe_stats_alloc(ppe, npu,
++					     ppe_num_stats_entries);
++		if (err)
++			goto error_npu_deinit;
+ 		err = npu->ops.ppe_init_stats(npu, ppe->foe_stats_dma,
+ 					      ppe_num_stats_entries);
+ 		if (err)
+-			goto error_npu_put;
++			goto error_npu_deinit;
+ 	}
+ 
+ 	airoha_ppe_hw_init(ppe);
+@@ -2601,7 +2754,17 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 
+ 	return 0;
+ 
+-error_npu_put:
++error_npu_deinit:
++	deinit_err = airoha_ppe_npu_quiesce(eth, npu);
++	if (deinit_err) {
++		/* Retain both the provider reference and DMA mappings. */
++		ppe->quarantine_npu = npu;
++		dev_err(eth->dev,
++			"failed to quiesce NPU after PPE setup error: %d\n",
++			deinit_err);
++		return err;
++	}
++	WRITE_ONCE(ppe->dma_quiesced, true);
+ 	airoha_npu_put(npu);
+ 
+ 	return err;
+@@ -2691,6 +2854,7 @@ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ 	struct platform_device *pdev;
+ 	struct device_node *np;
+ 	struct airoha_eth *eth;
++	int err = -ENODEV;
+ 
+ 	np = of_parse_phandle(dev->of_node, "airoha,eth", 0);
+ 	if (!np)
+@@ -2698,9 +2862,9 @@ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ 
+ 	pdev = of_find_device_by_node(np);
+ 	if (!pdev) {
+-		dev_err(dev, "cannot find device node %s\n", np->name);
++		dev_dbg(dev, "Ethernet provider %s is not ready\n", np->name);
+ 		of_node_put(np);
+-		return ERR_PTR(-ENODEV);
++		return ERR_PTR(-EPROBE_DEFER);
+ 	}
+ 	of_node_put(np);
+ 
+@@ -2710,13 +2874,16 @@ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ 	}
+ 
+ 	eth = platform_get_drvdata(pdev);
+-	if (!eth)
++	if (!eth || !test_bit(DEV_STATE_PPE_INITIALIZED, &eth->state)) {
++		err = -EPROBE_DEFER;
+ 		goto error_module_put;
++	}
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+ 		dev_err(&pdev->dev,
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
++		err = -EINVAL;
+ 		goto error_module_put;
+ 	}
+ 
+@@ -2727,7 +2894,7 @@ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ error_pdev_put:
+ 	platform_device_put(pdev);
+ 
+-	return ERR_PTR(-ENODEV);
++	return ERR_PTR(err);
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_get_dev);
+ 
+@@ -2852,9 +3019,35 @@ static int airoha_ppe_switchdev_event(struct notifier_block *nb,
+ 	return NOTIFY_DONE;
+ }
+ 
++static void airoha_ppe_release_dma(void *data)
++{
++	struct airoha_ppe *ppe = data;
++	struct device *dev = ppe->eth->dev;
++
++	if (!READ_ONCE(ppe->dma_quiesced)) {
++		dev_crit(dev,
++			 "retaining PPE DMA because firmware did not quiesce\n");
++		return;
++	}
++
++	if (ppe->foe_stats) {
++		dma_free_coherent(ppe->foe_stats_dev, ppe->foe_stats_size,
++				  ppe->foe_stats,
++				  ppe->foe_stats_dma);
++		ppe->foe_stats = NULL;
++		put_device(ppe->foe_stats_dev);
++		ppe->foe_stats_dev = NULL;
++	}
++	if (ppe->foe) {
++		dma_free_coherent(dev, ppe->foe_size, ppe->foe,
++				  ppe->foe_dma);
++		ppe->foe = NULL;
++	}
++}
++
+ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+-	int foe_size, err, ppe_num_stats_entries;
++	int foe_size, err;
+ 	u32 ppe_num_entries;
+ 	struct airoha_ppe *ppe;
+ 
+@@ -2867,30 +3060,26 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
+ 	eth->ppe = ppe;
++	WRITE_ONCE(ppe->dma_quiesced, true);
+ 
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 	foe_size = ppe_num_entries * sizeof(struct airoha_foe_entry);
+-	ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
+-				       GFP_KERNEL);
++	ppe->foe_size = foe_size;
++	ppe->foe = dma_alloc_coherent(eth->dev, ppe->foe_size, &ppe->foe_dma,
++				      GFP_KERNEL);
+ 	if (!ppe->foe)
+ 		return -ENOMEM;
+ 
++	err = devm_add_action_or_reset(eth->dev, airoha_ppe_release_dma, ppe);
++	if (err)
++		return err;
++
+ 	ppe->foe_flow = devm_kzalloc(eth->dev,
+ 				     ppe_num_entries * sizeof(*ppe->foe_flow),
+ 				     GFP_KERNEL);
+ 	if (!ppe->foe_flow)
+ 		return -ENOMEM;
+ 
+-	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+-	if (ppe_num_stats_entries > 0) {
+-		foe_size = ppe_num_stats_entries * sizeof(*ppe->foe_stats);
+-		ppe->foe_stats = dmam_alloc_coherent(eth->dev, foe_size,
+-						     &ppe->foe_stats_dma,
+-						     GFP_KERNEL);
+-		if (!ppe->foe_stats)
+-			return -ENOMEM;
+-	}
+-
+ 	ppe->foe_check_time = devm_kzalloc(eth->dev,
+ 					   ppe_num_entries * sizeof(*ppe->foe_check_time),
+ 					   GFP_KERNEL);
+@@ -2921,8 +3110,6 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
+ 
+-	WRITE_ONCE(airoha_ppe_active, ppe);
+-
+ 	ppe->netdev_notifier.notifier_call = airoha_ppe_netdev_event;
+ 	err = register_netdevice_notifier(&ppe->netdev_notifier);
+ 	if (err)
+@@ -2933,6 +3120,8 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (err)
+ 		goto error_netdev_notifier;
+ 
++	WRITE_ONCE(airoha_ppe_active, ppe);
++
+ 	return 0;
+ 
+ error_netdev_notifier:
+@@ -2947,10 +3136,14 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	return err;
+ }
+ 
+-void airoha_ppe_deinit(struct airoha_eth *eth)
++bool airoha_ppe_deinit(struct airoha_eth *eth)
+ {
++	struct airoha_ppe *ppe = eth->ppe;
+ 	struct airoha_npu *npu;
++	bool quiesced;
++	int err;
+ 
++	clear_bit(DEV_STATE_PPE_INITIALIZED, &eth->state);
+ 	WRITE_ONCE(airoha_ppe_active, NULL);
+ 
+ 	unregister_switchdev_notifier(&eth->ppe->switchdev_notifier);
+@@ -2961,10 +3154,29 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+ 				  lockdep_is_held(&flow_offload_mutex));
+-	if (npu) {
++	if (npu)
+ 		synchronize_rcu();
+-		npu->ops.ppe_deinit(npu);
+-		airoha_npu_put(npu);
++	else
++		npu = ppe->quarantine_npu;
++
++	if (npu) {
++		err = airoha_ppe_npu_quiesce(eth, npu);
++		if (err) {
++			dev_warn(eth->dev,
++				 "PPE graceful stop failed (%d), forcing terminal fence\n",
++				 err);
++			err = airoha_ppe_terminal_fence(eth, npu);
++		}
++		if (err) {
++			ppe->quarantine_npu = npu;
++			dev_crit(eth->dev,
++				 "PPE terminal fence failed, quarantining DMA: %d\n",
++				 err);
++		} else {
++			ppe->quarantine_npu = NULL;
++			WRITE_ONCE(ppe->dma_quiesced, true);
++			airoha_npu_put(npu);
++		}
+ 	}
+ 
+ 	mutex_unlock(&flow_offload_mutex);
+@@ -2972,4 +3184,7 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 	rhashtable_destroy(&eth->ppe->l2_flows);
+ 	rhashtable_destroy(&eth->flow_table);
+ 	debugfs_remove(eth->ppe->debugfs_dir);
++
++	quiesced = READ_ONCE(ppe->dma_quiesced);
++	return quiesced;
+ }
