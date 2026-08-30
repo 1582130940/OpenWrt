@@ -1,0 +1,51 @@
+From dd4aacf299f993d4e47e27d046a98bdcda335070 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 23:00:41 +0800
+Subject: [PATCH 2/8] clk: en7523: propagate reset regmap errors
+
+Reset assert, deassert, and status callers rely on these callbacks when
+fencing hardware before DMA memory is released. Return the underlying
+regmap write and read errors instead of reporting success with stale or
+uninitialized state.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/clk/clk-en7523.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/clk/clk-en7523.c b/drivers/clk/clk-en7523.c
+index dc4495f5f..2e4aecc54 100644
+--- a/drivers/clk/clk-en7523.c
++++ b/drivers/clk/clk-en7523.c
+@@ -1038,10 +1038,8 @@ static int en7523_reset_update(struct reset_controller_dev *rcdev,
+ 	else
+ 		val |= assert ? BIT(id % RST_NR_PER_BANK) : 0;
+ 
+-	regmap_update_bits(rst_data->map, addr, BIT(id % RST_NR_PER_BANK),
+-			   val);
+-
+-	return 0;
++	return regmap_update_bits(rst_data->map, addr,
++				  BIT(id % RST_NR_PER_BANK), val);
+ }
+ 
+ static int en7523_reset_assert(struct reset_controller_dev *rcdev,
+@@ -1062,13 +1060,17 @@ static int en7523_reset_status(struct reset_controller_dev *rcdev,
+ 	struct en_rst_data *rst_data = container_of(rcdev, struct en_rst_data, rcdev);
+ 	u32 addr = rst_data->bank_ofs[id / RST_NR_PER_BANK];
+ 	bool inverted = false;
++	int err;
+ 	u32 val;
+ 
+ 	/* For PCIC reset logic is inverted, 0:assert 1:deassert*/
+ 	if (addr == REG_NP_SCU_PCIC)
+ 		inverted = true;
+ 
+-	regmap_read(rst_data->map, addr, &val);
++	err = regmap_read(rst_data->map, addr, &val);
++	if (err)
++		return err;
++
+ 	val &= BIT(id % RST_NR_PER_BANK);
+ 	return inverted ? !val : !!val;
+ }
