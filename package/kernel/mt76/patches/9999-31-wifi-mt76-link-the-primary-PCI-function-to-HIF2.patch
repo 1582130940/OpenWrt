@@ -1,0 +1,156 @@
+From 644f50d7f6d8b6d49cccf53a6557a89be02bc259 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 30 Aug 2026 22:00:05 +0800
+Subject: [PATCH 10/12] wifi: mt76: link the primary PCI function to HIF2
+
+Record the primary PCI function as the HIF2 companion so WED teardown
+and recovery can walk both devices consistently. This avoids leaving the
+secondary path attached to a stale parent during reset.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ mt7996/pci.c | 75 ++++++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 64 insertions(+), 11 deletions(-)
+
+diff --git a/mt7996/pci.c b/mt7996/pci.c
+index c036f73..f2d38e6 100644
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -30,8 +30,9 @@ static const struct pci_device_id mt7996_hif_device_table[] = {
+ 	{ },
+ };
+ 
+-static struct mt7996_hif *mt7996_pci_get_hif2(u32 idx)
++static struct pci_dev *mt7996_pci_get_hif2_dev(u32 idx)
+ {
++	struct pci_dev *pdev = NULL;
+ 	struct mt7996_hif *hif;
+ 	u32 val;
+ 
+@@ -43,15 +44,29 @@ static struct mt7996_hif *mt7996_pci_get_hif2(u32 idx)
+ 		if (val != idx)
+ 			continue;
+ 
+-		get_device(hif->dev);
+-		goto out;
++		pdev = pci_dev_get(to_pci_dev(hif->dev));
++		break;
+ 	}
+-	hif = NULL;
++	spin_unlock_bh(&hif_lock);
++
++	return pdev;
++}
++
++static struct mt7996_hif *mt7996_pci_get_hif2(struct pci_dev *pdev)
++{
++	struct mt7996_hif *hif, *match = NULL;
+ 
+-out:
++	spin_lock_bh(&hif_lock);
++	list_for_each_entry(hif, &hif_list, list) {
++		if (hif->dev != &pdev->dev)
++			continue;
++
++		match = hif;
++		break;
++	}
+ 	spin_unlock_bh(&hif_lock);
+ 
+-	return hif;
++	return match;
+ }
+ 
+ static void mt7996_put_hif2(struct mt7996_hif *hif)
+@@ -62,7 +77,7 @@ static void mt7996_put_hif2(struct mt7996_hif *hif)
+ 	put_device(hif->dev);
+ }
+ 
+-static struct mt7996_hif *mt7996_pci_init_hif2(struct pci_dev *pdev)
++static struct pci_dev *mt7996_pci_init_hif2(struct pci_dev *pdev)
+ {
+ 	u32 idx;
+ 
+@@ -73,7 +88,7 @@ static struct mt7996_hif *mt7996_pci_init_hif2(struct pci_dev *pdev)
+ 	writel(idx | MT_PCIE_RECOG_ID_SEM,
+ 	       pcim_iomap_table(pdev)[0] + MT_PCIE_RECOG_ID);
+ 
+-	return mt7996_pci_get_hif2(idx);
++	return mt7996_pci_get_hif2_dev(idx);
+ }
+ 
+ static int mt7996_pci_hif2_probe(struct pci_dev *pdev)
+@@ -99,6 +114,7 @@ static int mt7996_pci_hif2_probe(struct pci_dev *pdev)
+ static int mt7996_pci_probe(struct pci_dev *pdev,
+ 			    const struct pci_device_id *id)
+ {
++	struct device_link *hif2_link;
+ 	struct pci_dev *hif2_dev;
+ 	struct mt7996_hif *hif2;
+ 	struct mt7996_dev *dev;
+@@ -137,9 +153,43 @@ static int mt7996_pci_probe(struct pci_dev *pdev,
+ 
+ 	mdev = &dev->mt76;
+ 	mt7996_wfsys_reset(dev);
+-	hif2 = mt7996_pci_init_hif2(pdev);
++	hif2_dev = mt7996_pci_init_hif2(pdev);
++	hif2 = NULL;
++	if (!hif2_dev)
++		goto init_npu;
++	if (!device_trylock(&hif2_dev->dev)) {
++		ret = -EPROBE_DEFER;
++		goto put_hif2_dev;
++	}
++	if (READ_ONCE(hif2_dev->dev.links.status) != DL_DEV_DRIVER_BOUND) {
++		ret = -EPROBE_DEFER;
++		goto unlock_hif2_dev;
++	}
++
++	hif2 = mt7996_pci_get_hif2(hif2_dev);
++	if (!hif2) {
++		ret = -EPROBE_DEFER;
++		goto unlock_hif2_dev;
++	}
++
++	hif2_link = device_link_add(&pdev->dev, &hif2_dev->dev,
++				    DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!hif2_link) {
++		dev_err(&pdev->dev, "failed to create device link to HIF2\n");
++		ret = -EINVAL;
++		goto unlock_hif2_dev;
++	}
++
++	/* A non-NULL link alone does not prove the supplier is probe-safe. */
++	if (READ_ONCE(hif2_link->status) != DL_STATE_CONSUMER_PROBE) {
++		dev_dbg(&pdev->dev, "HIF2 supplier is unbinding; deferring\n");
++		ret = -EPROBE_DEFER;
++		goto unlock_hif2_dev;
++	}
+ 	dev->hif2 = hif2;
++	device_unlock(&hif2_dev->dev);
+ 
++init_npu:
+ 	ret = mt76_npu_init(mdev, pci_resource_start(pdev, 0),
+ 			    pci_domain_nr(pdev->bus) ? 3 : 2);
+ 	if (ret && device_property_present(mdev->dev, "airoha,npu")) {
+@@ -173,8 +223,6 @@ static int mt7996_pci_probe(struct pci_dev *pdev,
+ 	mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);
+ 
+ 	if (hif2) {
+-		hif2_dev = container_of(hif2->dev, struct pci_dev, dev);
+-
+ 		ret = mt7996_mmio_wed_init(dev, hif2_dev, true, &hif2_irq);
+ 		if (ret < 0)
+ 			goto free_hif2_wed_irq_vector;
+@@ -250,6 +298,11 @@ free_wed_or_irq_vector:
+ put_hif2:
+ 	mt7996_put_hif2(dev->hif2);
+ 	dev->hif2 = NULL;
++	goto free_device;
++unlock_hif2_dev:
++	device_unlock(&hif2_dev->dev);
++put_hif2_dev:
++	pci_dev_put(hif2_dev);
+ free_device:
+ 	mt76_free_device(&dev->mt76);
+ 
