@@ -1,0 +1,29 @@
+From 217725b912947180b92f103b21e4eac127e64a36 Mon Sep 17 00:00:00 2001
+From: Daniel Pawlik <pawlik.dan@gmail.com>
+Date: Sun, 30 Aug 2026 23:00:41 +0800
+Subject: [PATCH 1/8] net: airoha: npu: set streaming DMA aperture
+
+The NPU mailbox bounce buffers are constrained to the AN7581 low-address
+DMA aperture, but the driver only set the coherent DMA mask. Set the
+device bus DMA limit and program both streaming and coherent DMA masks so
+later mappings cannot return addresses the NPU cannot access.
+
+Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index b5617e809..c6b6f6fb7 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -879,7 +879,8 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 		npu->irqs[i] = irq;
+ 	}
+ 
+-	err = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
++	dev->bus_dma_limit = NPU_DMA_ADDR_MAX;
++	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 	if (err)
+ 		return err;
+ 
