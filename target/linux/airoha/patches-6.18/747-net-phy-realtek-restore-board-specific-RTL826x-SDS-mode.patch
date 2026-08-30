@@ -1,0 +1,159 @@
+From 85640487ce44a569c1ab49b7bc8460277d4a62d3 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:29:12 +0800
+Subject: [PATCH 5/6] net: phy: realtek: restore board-specific RTL826x SDS
+ mode
+
+The RTL826x firmware loader can leave the SerDes host mode at its
+default value after firmware initialization. Add an optional
+realtek,sds-mode property, restore the board-selected mode after the
+firmware sequence, and verify the readback.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ .../bindings/net/realtek,rtl82xx.yaml         |  7 +++
+ drivers/net/phy/realtek/phy_patch_rtl826x.c   |  6 +-
+ drivers/net/phy/realtek/phy_patch_rtl826x.h   |  4 ++
+ drivers/net/phy/realtek/realtek_main.c        | 58 +++++++++++++++++++
+ 4 files changed, 72 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml b/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml
+index 2b5697bd7..024c585b7 100644
+--- a/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml
++++ b/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml
+@@ -50,6 +50,13 @@ properties:
+     description:
+       Enable ALDPS mode, ALDPS mode default is disabled after hardware reset.
+ 
++  realtek,sds-mode:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 65535
++    description: |
++      Board-specific 16-bit host SerDes mode programmed into SDS page 6,
++      register 3 after the RTL825x/RTL826x firmware initialization sequence.
++
+   wakeup-source:
+     type: boolean
+     description:
+diff --git a/drivers/net/phy/realtek/phy_patch_rtl826x.c b/drivers/net/phy/realtek/phy_patch_rtl826x.c
+index e0f448d47..9dfe87bb0 100644
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.c
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.c
+@@ -70,7 +70,7 @@ static int rtl826x_phy_patch_wait(struct phy_device *phydev, u32 mmd_addr, u32 m
+ 	return 0;
+ }
+ 
+-static int rtl826x_phy_patch_sds_get(struct phy_device *phydev, u32 sds_page, u32 sds_reg)
++int rtl826x_phy_patch_sds_get(struct phy_device *phydev, u32 sds_page, u32 sds_reg)
+ {
+ 	u32 sds_addr = 0x8000 + (sds_reg << 6) + sds_page;
+ 	int ret;
+@@ -86,8 +86,8 @@ static int rtl826x_phy_patch_sds_get(struct phy_device *phydev, u32 sds_page, u3
+ 	return phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x142);
+ }
+ 
+-static int rtl826x_phy_patch_sds_set(struct phy_device *phydev, u32 sds_page, u32 sds_reg,
+-				     u32 data)
++int rtl826x_phy_patch_sds_set(struct phy_device *phydev, u32 sds_page,
++			      u32 sds_reg, u32 data)
+ {
+ 	u32 sds_addr = 0x8800 + (sds_reg << 6) + sds_page;
+ 	int ret;
+diff --git a/drivers/net/phy/realtek/phy_patch_rtl826x.h b/drivers/net/phy/realtek/phy_patch_rtl826x.h
+index b38c33853..b9e5882db 100644
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.h
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.h
+@@ -5,6 +5,10 @@
+ 
+ #include <linux/phy.h>
+ 
++int rtl826x_phy_patch_sds_get(struct phy_device *phydev, u32 sds_page,
++			      u32 sds_reg);
++int rtl826x_phy_patch_sds_set(struct phy_device *phydev, u32 sds_page,
++			      u32 sds_reg, u32 data);
+ int rtl8261n_phy_patch_db_init(struct phy_device *phydev);
+ int rtl8264b_phy_patch_db_init(struct phy_device *phydev);
+ 
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+index 8160c44eb..2594066f6 100644
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -222,6 +222,9 @@
+ #define RTL826X_VEND1_VERSION_ID		0x104
+ #define   RTL826X_VEND1_VERSION_ID_VARIANT	GENMASK(2, 0)
+ 
++#define RTL826X_SDS_HOST_MODE_PAGE		6
++#define RTL826X_SDS_HOST_MODE_REG		3
++
+ #define RTL826X_VND2_INER			0xA424
+ #define   RTL826X_VND2_INER_LINK_STATUS		BIT(4)
+ #define   RTL826X_VND2_INER_PME			BIT(7)
+@@ -2392,6 +2395,57 @@ static int rtl826x_probe(struct phy_device *phydev)
+ 	return 0;
+ }
+ 
++static int rtl826x_config_sds_mode(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	u32 mode;
++	int readback;
++	int ret;
++
++	if (!device_property_present(dev, "realtek,sds-mode"))
++		return 0;
++
++	ret = device_property_read_u32(dev, "realtek,sds-mode", &mode);
++	if (ret) {
++		phydev_err(phydev, "failed to read SDS mode: %d\n", ret);
++		return ret;
++	}
++
++	if (mode > 0xffff) {
++		phydev_err(phydev, "invalid SDS mode 0x%x\n", mode);
++		return -EINVAL;
++	}
++
++	ret = rtl826x_phy_patch_sds_set(phydev,
++					RTL826X_SDS_HOST_MODE_PAGE,
++					RTL826X_SDS_HOST_MODE_REG, mode);
++	if (ret) {
++		phydev_err(phydev, "failed to set SDS mode 0x%04x: %d\n",
++			   mode, ret);
++		return ret;
++	}
++
++	readback = rtl826x_phy_patch_sds_get(phydev,
++					     RTL826X_SDS_HOST_MODE_PAGE,
++					     RTL826X_SDS_HOST_MODE_REG);
++	if (readback < 0) {
++		phydev_err(phydev, "failed to read back SDS mode: %d\n",
++			   readback);
++		return readback;
++	}
++
++	if (readback != mode) {
++		phydev_err(phydev,
++			   "SDS mode readback mismatch: wrote 0x%04x, read 0x%04x\n",
++			   mode, readback);
++		return -EIO;
++	}
++
++	phydev_info(phydev, "configured SDS mode 0x%04x\n", mode);
++
++	return 0;
++}
++
+ static int rtl826x_config_serdes_polarity(struct phy_device *phydev)
+ {
+ 	struct device *dev = &phydev->mdio.dev;
+@@ -2477,6 +2531,10 @@ static int rtl826x_config_init(struct phy_device *phydev)
+ 		return ret;
+ 	}
+ 
++	ret = rtl826x_config_sds_mode(phydev);
++	if (ret)
++		return ret;
++
+ 	return rtl826x_config_serdes_polarity(phydev);
+ }
+ 
