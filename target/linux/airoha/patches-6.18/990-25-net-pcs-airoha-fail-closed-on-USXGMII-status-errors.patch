@@ -1,0 +1,72 @@
+From 51a4b339f253cf779dbc7da43d5df880f866fb50 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:29:12 +0800
+Subject: [PATCH 2/6] net: pcs: airoha: fail closed on USXGMII status errors
+
+Do not decode uninitialized autonegotiation status when a PCS regmap
+access fails. Report link down for that poll and let the next phylink
+poll retry the hardware read.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 32 +++++++++++++++++-----
+ 1 file changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 89ef96400..297baa15e 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -404,7 +404,8 @@ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index
+ {
+ 	const struct airoha_pcs_match_data *data = priv->data;
+ 	struct airoha_pcs_maps *maps = &priv->maps[index];
+-	u32 an_done, lpa;
++	u32 an_done = 0, lpa = 0;
++	int ret;
+ 
+ 	/* Trigger HW workaround if needed. If an error is reported,
+ 	 * consider link down and test again later.
+@@ -415,13 +416,25 @@ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index
+ 	}
+ 
+ 	/* Toggle AN Status */
+-	regmap_set_bits(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_CONTROL_6,
+-			AIROHA_PCS_USXGMII_TOG_PCS_AUTONEG_STS);
+-	regmap_clear_bits(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_CONTROL_6,
+-			  AIROHA_PCS_USXGMII_TOG_PCS_AUTONEG_STS);
++	ret = regmap_set_bits(maps->usxgmii_pcs,
++			      AIROHA_PCS_USXGMII_PCS_AN_CONTROL_6,
++			      AIROHA_PCS_USXGMII_TOG_PCS_AUTONEG_STS);
++	if (ret)
++		goto error;
++	ret = regmap_clear_bits(maps->usxgmii_pcs,
++				AIROHA_PCS_USXGMII_PCS_AN_CONTROL_6,
++				AIROHA_PCS_USXGMII_TOG_PCS_AUTONEG_STS);
++	if (ret)
++		goto error;
+ 
+-	regmap_read(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_STATS_0, &lpa);
+-	regmap_read(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_STATS_2, &an_done);
++	ret = regmap_read(maps->usxgmii_pcs,
++			  AIROHA_PCS_USXGMII_PCS_AN_STATS_0, &lpa);
++	if (ret)
++		goto error;
++	ret = regmap_read(maps->usxgmii_pcs,
++			  AIROHA_PCS_USXGMII_PCS_AN_STATS_2, &an_done);
++	if (ret)
++		goto error;
+ 
+ 	state->link = !!(lpa & MDIO_USXGMII_LINK);
+ 	state->an_complete = !!(an_done & AIROHA_PCS_USXGMII_PCS_AN_COMPLETE);
+@@ -432,6 +445,11 @@ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index
+ 		dev_dbg_ratelimited(priv->dev,
+ 				    "port %d USXGMII AN down: stats0=%#010x stats2=%#010x\n",
+ 				    index, lpa, an_done);
++	return;
++
++error:
++	state->link = false;
++	state->an_complete = false;
+ }
+ 
+ static void airoha_pcs_get_state_10gbaser(struct airoha_pcs_priv *priv, int index,
