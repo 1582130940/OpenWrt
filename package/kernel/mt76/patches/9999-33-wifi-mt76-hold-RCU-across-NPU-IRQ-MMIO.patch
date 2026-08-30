@@ -1,0 +1,58 @@
+From 5a4a7fcaecdfc62bfc2201efd3201a7a13d72ab7 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:00:05 +0800
+Subject: [PATCH 12/12] wifi: mt76: hold RCU across NPU IRQ MMIO
+
+Hold the provider RCU read-side section across WLAN IRQ MMIO access.
+This matches the queue MMIO contract and prevents IRQ acknowledgement
+from dereferencing an unpublished NPU provider.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ mt7996/npu.c | 2 ++
+ npu.c        | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/mt7996/npu.c b/mt7996/npu.c
+index 7bbbbbe..3b30765 100644
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -571,8 +571,10 @@ static int mt7996_npu_hw_init_once(struct mt7996_dev *dev,
+ 	if (err)
+ 		return err;
+ 
++	rcu_read_lock();
+ 	for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++)
+ 		airoha_npu_wlan_enable_irq(npu, i - MT_RXQ_NPU0);
++	rcu_read_unlock();
+ 
+ 	return 0;
+ }
+diff --git a/npu.c b/npu.c
+index 2943893..5d91b0c 100644
+--- a/npu.c
++++ b/npu.c
+@@ -378,9 +378,11 @@ void mt76_npu_rx_queues_deinit(struct mt76_dev *dev)
+ 		if (irq_registered) {
+ 			WRITE_ONCE(q->npu_irq_registered, false);
+ 			if (npu) {
++				rcu_read_lock();
+ 				status = airoha_npu_wlan_get_irq_status(npu, index);
+ 				airoha_npu_wlan_set_irq_status(npu, status);
+ 				airoha_npu_wlan_disable_irq(npu, index);
++				rcu_read_unlock();
+ 			}
+ 
+ 			devm_free_irq(dev->dev, q->npu_irq, q);
+@@ -395,9 +397,11 @@ void mt76_npu_rx_queues_deinit(struct mt76_dev *dev)
+ 
+ 		/* A poll already completing can race the first IRQ mask. */
+ 		if (npu && (irq_registered || napi_registered)) {
++			rcu_read_lock();
+ 			status = airoha_npu_wlan_get_irq_status(npu, index);
+ 			airoha_npu_wlan_set_irq_status(npu, status);
+ 			airoha_npu_wlan_disable_irq(npu, index);
++			rcu_read_unlock();
+ 		}
+ 
+ 		if (q->page_pool) {
