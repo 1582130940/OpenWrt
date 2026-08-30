@@ -1,0 +1,133 @@
+From 05bfa5d8d1d649a28b984f3caf9e08910f1bb855 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:00:05 +0800
+Subject: [PATCH 11/12] wifi: mt76: keep L1 recovery handshakes quiesced
+
+Do not let firmware recovery or coredump work restart queues after a
+terminal stop has begun. L1 recovery now leaves handshakes quiesced
+when the device is being removed or quarantined.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ mt7996/init.c |  5 +++++
+ mt7996/mac.c  | 62 +++++++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 50 insertions(+), 17 deletions(-)
+
+diff --git a/mt7996/init.c b/mt7996/init.c
+index 7e7c3cc..17a3a4b 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -2050,6 +2050,11 @@ void mt7996_npu_pre_stop(struct mt7996_dev *dev)
+ 		mt76_napi_disable(&dev->mt76, MT76_NAPI_TX,
+ 				  &dev->mt76.tx_napi);
+ 
++	/* A poll completing during quiesce can re-enable its IRQ. */
++	mt76_npu_disable_irqs(&dev->mt76);
++	mt7996_irq_disable(dev, ~0);
++	WRITE_ONCE(dev->mt76.mmio.irqmask, irqmask);
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed_hif2);
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 9db0d63..453ee23 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -3,7 +3,9 @@
+  * Copyright (C) 2022 MediaTek Inc.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/etherdevice.h>
++#include <linux/jiffies.h>
+ #include <linux/timekeeping.h>
+ #include "coredump.h"
+ #include "mt7996.h"
+@@ -2066,17 +2068,36 @@ void mt7996_update_channel(struct mt76_phy *mphy)
+ 	state->noise = -(phy->noise >> 4);
+ }
+ 
+-static bool
+-mt7996_wait_reset_state(struct mt7996_dev *dev, u32 state)
++static int mt7996_poll_reset_state(struct mt7996_dev *dev, u32 expected)
+ {
+-	bool ret;
++	const u32 fatal = MT_MCU_CMD_ERROR_MASK &
++		~(MT_MCU_CMD_STOP_DMA | MT_MCU_CMD_RESET_DONE |
++		  MT_MCU_CMD_RECOVERY_DONE | MT_MCU_CMD_NORMAL_STATE);
++	unsigned long timeout = jiffies + MT7996_RESET_TIMEOUT;
++	u32 val;
+ 
+-	ret = wait_event_timeout(dev->reset_wait,
+-				 (READ_ONCE(dev->recovery.state) & state),
+-				 MT7996_RESET_TIMEOUT);
++	do {
++		if (READ_ONCE(dev->terminal))
++			return -ESHUTDOWN;
++
++		val = mt76_rr(dev, MT_MCU_CMD);
++		if (val == U32_MAX)
++			return -EIO;
++		if (val) {
++			mt76_wr(dev, MT_MCU_CMD, val);
++			WRITE_ONCE(dev->recovery.state, val);
++			if (val & (MT_MCU_CMD_WDT_MASK | fatal))
++				return -EIO;
++			if (val & expected)
++				return 0;
++		}
+ 
+-	WARN(!ret, "Timeout waiting for MCU reset state %x\n", state);
+-	return ret;
++		usleep_range(1000, 2000);
++	} while (time_before(jiffies, timeout));
++
++	dev_warn(dev->mt76.dev, "Timeout waiting for MCU reset state %x\n",
++		 expected);
++	return -ETIMEDOUT;
+ }
+ 
+ static void
+@@ -2574,18 +2595,24 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+ 
+-	if (mt7996_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
+-		mt7996_dma_reset(dev, false);
++	err = mt7996_poll_reset_state(dev, MT_MCU_CMD_RESET_DONE);
++	if (err)
++		goto fail_unlock;
+ 
+-		mt7996_tx_token_put(dev);
+-		idr_init(&dev->mt76.token);
++	mt7996_dma_reset(dev, false);
+ 
+-		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+-		mt7996_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
+-	}
++	mt7996_tx_token_put(dev);
++	idr_init(&dev->mt76.token);
++
++	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
++	err = mt7996_poll_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
++	if (err)
++		goto fail_unlock;
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+-	mt7996_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
++	err = mt7996_poll_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
++	if (err)
++		goto fail_unlock;
+ 
+ 	/* enable DMA Rx/Tx and interrupt */
+ 	mt7996_dma_start(dev, false, false);
+@@ -2640,7 +2667,8 @@ fail_unlock:
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 	mt7996_npu_recovery_failed(dev,
+-				   "NPU reinitialization after L1 recovery", err);
++				   "L1 reset handshake or NPU reinitialization",
++				   err);
+ }
+ 
+ /* firmware coredump */
