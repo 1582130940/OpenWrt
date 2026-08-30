@@ -1,0 +1,38 @@
+From 3c9f23e7b67c2c5b1496d7ba810f728827469848 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 30 Aug 2026 21:51:43 +0800
+Subject: [PATCH 05/12] wifi: mt76: gate NPU queue MMIO through the provider
+
+Route NPU queue register access through the provider while holding the
+required RCU read-side section. Consumers now fail closed when the
+provider has stopped publishing queue MMIO.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ dma.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/dma.h b/dma.h
+index 7694764..764d7e2 100644
+--- a/dma.h
++++ b/dma.h
+@@ -66,7 +66,8 @@ mt76_dma_handle_read(struct mt76_queue *q, u32 offset, u32 *val)
+ 		rcu_read_lock();
+ 		npu = rcu_dereference(q->dev->mmio.npu);
+ 		if (npu)
+-			regmap_read(npu->regmap, q->wed_regs + offset, val);
++			airoha_npu_wlan_queue_read(npu, q->wed_regs + offset,
++						   val);
+ 		rcu_read_unlock();
+ 
+ 		return true;
+@@ -93,7 +94,8 @@ mt76_dma_handle_write(struct mt76_queue *q, u32 offset, u32 val)
+ 		rcu_read_lock();
+ 		npu = rcu_dereference(q->dev->mmio.npu);
+ 		if (npu)
+-			regmap_write(npu->regmap, q->wed_regs + offset, val);
++			airoha_npu_wlan_queue_write(npu, q->wed_regs + offset,
++						    val);
+ 		rcu_read_unlock();
+ 
+ 		return true;
