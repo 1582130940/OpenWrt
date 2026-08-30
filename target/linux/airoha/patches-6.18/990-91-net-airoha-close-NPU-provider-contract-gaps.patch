@@ -1,0 +1,131 @@
+From 83c90afec72242c83588ec6fbedf1ed4b7dcfb68 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 23:58:52 +0800
+Subject: [PATCH 8/8] net: airoha: close NPU provider contract gaps
+
+Move WLAN IRQ status and mask MMIO under the same RCU hard-stop contract used
+by queue MMIO so packet-path callers do not take the shared provider I/O lock.
+
+Treat the mailbox reserved-memory pool as optional and attach it only when the
+device tree names an mbox region; otherwise the coherent allocator remains
+constrained by the NPU DMA aperture.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c  | 61 ++++++++++++-----------
+ include/linux/soc/airoha/airoha_offload.h |  2 +-
+ 2 files changed, 33 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index 46b3419dd..8fa3e7d27 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -1019,48 +1019,46 @@ EXPORT_SYMBOL_GPL(airoha_npu_wlan_queue_write);
+ 
+ static void airoha_npu_wlan_irq_status_set(struct airoha_npu *npu, u32 val)
+ {
+-	unsigned long flags;
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "NPU IRQ status write without RCU read lock");
++	if (atomic_read_acquire(&npu->stopped))
++		return;
+ 
+-	spin_lock_irqsave(&npu->io_lock, flags);
+-	if (!atomic_read_acquire(&npu->stopped))
+-		regmap_write(npu->regmap, REG_IRQ_STATUS, val);
+-	spin_unlock_irqrestore(&npu->io_lock, flags);
++	regmap_write(npu->regmap, REG_IRQ_STATUS, val);
+ }
+ 
+ static u32 airoha_npu_wlan_irq_status_get(struct airoha_npu *npu, int q)
+ {
+-	unsigned long flags;
+ 	u32 val = 0;
+ 
+-	spin_lock_irqsave(&npu->io_lock, flags);
+-	if (!atomic_read_acquire(&npu->stopped) &&
+-	    regmap_read(npu->regmap, REG_IRQ_STATUS, &val))
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "NPU IRQ status read without RCU read lock");
++	if (atomic_read_acquire(&npu->stopped))
++		return 0;
++	if (regmap_read(npu->regmap, REG_IRQ_STATUS, &val))
+ 		val = 0;
+-	spin_unlock_irqrestore(&npu->io_lock, flags);
+ 
+ 	return val & NPU_IRQ_RX_MASK(q);
+ }
+ 
+ static void airoha_npu_wlan_irq_enable(struct airoha_npu *npu, int q)
+ {
+-	unsigned long flags;
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "NPU IRQ enable without RCU read lock");
++	if (atomic_read_acquire(&npu->stopped))
++		return;
+ 
+-	spin_lock_irqsave(&npu->io_lock, flags);
+-	if (!atomic_read_acquire(&npu->stopped))
+-		regmap_set_bits(npu->regmap, REG_IRQ_RXDONE(q),
+-				NPU_IRQ_RX_MASK(q));
+-	spin_unlock_irqrestore(&npu->io_lock, flags);
++	regmap_set_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
+ static void airoha_npu_wlan_irq_disable(struct airoha_npu *npu, int q)
+ {
+-	unsigned long flags;
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "NPU IRQ disable without RCU read lock");
++	if (atomic_read_acquire(&npu->stopped))
++		return;
+ 
+-	spin_lock_irqsave(&npu->io_lock, flags);
+-	if (!atomic_read_acquire(&npu->stopped))
+-		regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(q),
+-				  NPU_IRQ_RX_MASK(q));
+-	spin_unlock_irqrestore(&npu->io_lock, flags);
++	regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
+ struct airoha_npu *airoha_npu_get(struct device *dev)
+@@ -1249,14 +1247,19 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 	if (err)
+ 		return err;
+ 
+-	err = of_reserved_mem_device_init_by_name(dev, dev->of_node, "mbox");
+-	if (err)
+-		return dev_err_probe(dev, err,
+-				     "failed to initialize NPU mailbox pool\n");
++	if (of_property_match_string(dev->of_node, "memory-region-names",
++				     "mbox") >= 0) {
++		err = of_reserved_mem_device_init_by_name(dev, dev->of_node,
++							  "mbox");
++		if (err)
++			return dev_err_probe(dev, err,
++					     "failed to initialize NPU mailbox pool\n");
+ 
+-	err = devm_add_action_or_reset(dev, airoha_npu_release_mbox_pool, npu);
+-	if (err)
+-		return err;
++		err = devm_add_action_or_reset(dev, airoha_npu_release_mbox_pool,
++					       npu);
++		if (err)
++			return err;
++	}
+ 	err = devm_add_action_or_reset(dev, airoha_npu_release_mbox_buffers,
+ 				       npu);
+ 	if (err)
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index eef43c83d..9d6eeb266 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -249,7 +249,7 @@ int airoha_npu_recover(struct airoha_npu *npu);
+ int airoha_npu_recover_mailbox(struct airoha_npu *npu);
+ int airoha_npu_wait_recovery(struct airoha_npu *npu);
+ int airoha_npu_hard_stop(struct airoha_npu *npu);
+-/* Queue MMIO callers must hold an RCU read-side critical section. */
++/* Queue and WLAN IRQ MMIO callers must hold an RCU read-side section. */
+ int airoha_npu_wlan_queue_read(struct airoha_npu *npu, u32 addr, u32 *val);
+ int airoha_npu_wlan_queue_write(struct airoha_npu *npu, u32 addr, u32 val);
+ 
