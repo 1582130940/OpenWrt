@@ -1,0 +1,274 @@
+From c80790b1f3004cdb2a9578e0d7948916003cf5c3 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 30 Aug 2026 22:00:05 +0800
+Subject: [PATCH 09/12] wifi: mt76: drain a disabled IRQ tasklet safely
+
+Disable the IRQ tasklet before NPU DMA is stopped and re-enable it only
+after recovery has restored the queue state. Terminal quarantine kills
+the tasklet once teardown becomes unrecoverable.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+
+---
+diff --git a/mt7996/init.c b/mt7996/init.c
+index 1934fc12..b37476be 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1901,6 +1901,7 @@ int mt7996_register_device(struct mt7996_dev *dev)
+ 	INIT_WORK(&dev->dump_work, mt7996_mac_dump_work);
+ 	mutex_init(&dev->dump_mutex);
+ 	mutex_init(&dev->npu_stop_mutex);
++	mutex_init(&dev->irq_tasklet_mutex);
+ 
+ 	ret = mt7996_init_hardware(dev);
+ 	if (ret)
+@@ -1950,6 +1951,59 @@ error:
+ 	return ret;
+ }
+ 
++void mt7996_irq_tasklet_disable(struct mt7996_dev *dev)
++{
++	mutex_lock(&dev->irq_tasklet_mutex);
++	if (READ_ONCE(dev->terminal)) {
++		set_bit(MT76_MCU_RESET, &dev->mphy.state);
++		wake_up(&dev->mt76.mcu.wait);
++	}
++	if (!dev->irq_tasklet_disabled) {
++		tasklet_disable(&dev->mt76.irq_tasklet);
++		dev->irq_tasklet_disabled = true;
++	}
++	mutex_unlock(&dev->irq_tasklet_mutex);
++}
++
++bool mt7996_irq_tasklet_enable(struct mt7996_dev *dev)
++{
++	bool enabled = false;
++
++	mutex_lock(&dev->irq_tasklet_mutex);
++	if (!READ_ONCE(dev->terminal) && dev->irq_tasklet_disabled) {
++		dev->irq_tasklet_disabled = false;
++		tasklet_enable(&dev->mt76.irq_tasklet);
++		enabled = true;
++	}
++	mutex_unlock(&dev->irq_tasklet_mutex);
++
++	return enabled;
++}
++
++int mt7996_irq_tasklet_bootstrap(struct mt7996_dev *dev)
++{
++	bool enabled = false;
++	int ret = 0;
++
++	mutex_lock(&dev->irq_tasklet_mutex);
++	if (READ_ONCE(dev->terminal)) {
++		ret = -ESHUTDOWN;
++	} else {
++		clear_bit(MT76_MCU_RESET, &dev->mphy.state);
++		if (dev->irq_tasklet_disabled) {
++			dev->irq_tasklet_disabled = false;
++			tasklet_enable(&dev->mt76.irq_tasklet);
++			enabled = true;
++		}
++	}
++	mutex_unlock(&dev->irq_tasklet_mutex);
++
++	if (enabled)
++		tasklet_schedule(&dev->mt76.irq_tasklet);
++
++	return ret;
++}
++
+ void mt7996_npu_pre_stop(struct mt7996_dev *dev)
+ {
+ 	struct mt7996_phy *phy;
+@@ -1987,10 +2041,7 @@ void mt7996_npu_pre_stop(struct mt7996_dev *dev)
+ 	irqmask = READ_ONCE(dev->mt76.mmio.irqmask);
+ 	mt7996_irq_disable(dev, ~0);
+ 	WRITE_ONCE(dev->mt76.mmio.irqmask, irqmask);
+-	if (!dev->irq_tasklet_disabled) {
+-		tasklet_disable(&dev->mt76.irq_tasklet);
+-		dev->irq_tasklet_disabled = true;
+-	}
++	mt7996_irq_tasklet_disable(dev);
+ 
+ 	for (i = 0; i < __MT_RXQ_MAX; i++) {
+ 		if (test_bit(i, &dev->mt76.napi_registered))
+@@ -2038,11 +2089,8 @@ void mt7996_npu_post_reset(struct mt7996_dev *dev)
+ 		local_bh_enable();
+ 	}
+ 
+-	if (dev->irq_tasklet_disabled) {
+-		dev->irq_tasklet_disabled = false;
+-		tasklet_enable(&dev->mt76.irq_tasklet);
++	if (mt7996_irq_tasklet_enable(dev))
+ 		tasklet_schedule(&dev->mt76.irq_tasklet);
+-	}
+ 	mt76_worker_enable(&dev->mt76.tx_worker);
+ 
+ 	dev->napi_restore = 0;
+@@ -2081,7 +2129,6 @@ void mt7996_terminal_quiesce(struct mt7996_dev *dev)
+ void mt7996_quarantine_device(struct mt7996_dev *dev)
+ {
+ 	mt7996_terminal_quiesce(dev);
+-	tasklet_kill(&dev->mt76.irq_tasklet);
+ }
+ 
+ void __noreturn mt7996_fence_failed(struct mt7996_dev *dev,
+@@ -2092,11 +2139,25 @@ void __noreturn mt7996_fence_failed(struct mt7996_dev *dev,
+ 	      dev_name(dev->mt76.dev), phase, err);
+ }
+ 
++static void mt7996_free_irqs_and_kill_tasklet(struct mt7996_dev *dev)
++{
++	mt7996_free_irqs(dev);
++
++	/* A disabled, scheduled tasklet cannot clear TASKLET_STATE_SCHED. */
++	mutex_lock(&dev->irq_tasklet_mutex);
++	if (dev->irq_tasklet_disabled) {
++		dev->irq_tasklet_disabled = false;
++		tasklet_enable(&dev->mt76.irq_tasklet);
++	}
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	mutex_unlock(&dev->irq_tasklet_mutex);
++}
++
+ void mt7996_cleanup_device(struct mt7996_dev *dev)
+ {
+ 	int i;
+ 
+-	mt7996_free_irqs(dev);
++	mt7996_free_irqs_and_kill_tasklet(dev);
+ 	mt7996_unregister_phy(mt7996_phy3(dev));
+ 	mt7996_unregister_phy(mt7996_phy2(dev));
+ 	mt7996_unregister_thermal(&dev->phy);
+@@ -2127,11 +2188,6 @@ void mt7996_cleanup_device(struct mt7996_dev *dev)
+ 		mt7996_rro_msdu_page_map_free(dev);
+ 		dev->rro_hw_initialized = false;
+ 	}
+-	if (!dev->irq_tasklet_disabled) {
+-		tasklet_disable(&dev->mt76.irq_tasklet);
+-		dev->irq_tasklet_disabled = true;
+-	}
+-	tasklet_kill(&dev->mt76.irq_tasklet);
+ }
+ 
+ void mt7996_free_irqs(struct mt7996_dev *dev)
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index cb7f4e6e..c0e75103 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2197,13 +2197,16 @@ mt7996_wed_stop(struct mt7996_dev *dev)
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed);
+ }
+ 
+-static void mt7996_mac_restart_mcu_enable(struct mt7996_dev *dev)
++static int mt7996_mac_restart_mcu_enable(struct mt7996_dev *dev)
+ {
+ 	static const enum mt76_rxq_id mcu_qid[] = {
+ 		MT_RXQ_MCU,
+ 		MT_RXQ_MCU_WA,
+ 	};
+-	int i;
++	int i, ret;
++
++	if (READ_ONCE(dev->terminal))
++		return -ESHUTDOWN;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(mcu_qid); i++) {
+ 		int qid = mcu_qid[i];
+@@ -2215,13 +2218,9 @@ static void mt7996_mac_restart_mcu_enable(struct mt7996_dev *dev)
+ 		mt76_napi_enable(&dev->mt76, qid, &dev->mt76.napi[qid]);
+ 	}
+ 
+-	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+-
+-	if (dev->irq_tasklet_disabled) {
+-		dev->irq_tasklet_disabled = false;
+-		tasklet_enable(&dev->mt76.irq_tasklet);
+-		tasklet_schedule(&dev->mt76.irq_tasklet);
+-	}
++	ret = mt7996_irq_tasklet_bootstrap(dev);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(mcu_qid); i++) {
+ 		int qid = mcu_qid[i];
+@@ -2234,6 +2233,8 @@ static void mt7996_mac_restart_mcu_enable(struct mt7996_dev *dev)
+ 		napi_schedule(&dev->mt76.napi[qid]);
+ 		local_bh_enable();
+ 	}
++
++	return 0;
+ }
+ 
+ static void mt7996_mac_restart_mcu_disable(struct mt7996_dev *dev)
+@@ -2259,10 +2260,7 @@ static void mt7996_mac_restart_mcu_disable(struct mt7996_dev *dev)
+ 		if (dev->hif2)
+ 			mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0);
+ 	}
+-	if (!dev->irq_tasklet_disabled) {
+-		tasklet_disable(&dev->mt76.irq_tasklet);
+-		dev->irq_tasklet_disabled = true;
+-	}
++	mt7996_irq_tasklet_disable(dev);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(mcu_qid); i++) {
+ 		int qid = mcu_qid[i];
+@@ -2344,7 +2342,9 @@ mt7996_mac_restart(struct mt7996_dev *dev)
+ 		if (dev->hif2)
+ 			mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0xff);
+ 	}
+-	mt7996_mac_restart_mcu_enable(dev);
++	ret = mt7996_mac_restart_mcu_enable(dev);
++	if (ret)
++		goto out;
+ 
+ 	/* load firmware */
+ 	ret = mt7996_mcu_init_firmware(dev);
+diff --git a/mt7996/mmio.c b/mt7996/mmio.c
+index b2a07a26..ab372b36 100644
+--- a/mt7996/mmio.c
++++ b/mt7996/mmio.c
+@@ -750,6 +750,9 @@ static void mt7996_irq_tasklet(struct tasklet_struct *t)
+ 	struct mtk_wed_device *wed_hif2 = &dev->mt76.mmio.wed_hif2;
+ 	u32 i, intr, mask, intr1 = 0;
+ 
++	if (READ_ONCE(dev->terminal))
++		return;
++
+ 	if (dev->hif2 && mtk_wed_device_active(wed_hif2)) {
+ 		mtk_wed_device_irq_set_mask(wed_hif2, 0);
+ 		intr1 = mtk_wed_device_irq_get(wed_hif2,
+@@ -825,6 +828,8 @@ irqreturn_t mt7996_irq_handler(int irq, void *dev_instance)
+ 		else
+ 			mt76_wr(dev, MT_INT1_MASK_CSR, 0);
+ 	}
++	if (READ_ONCE(dev->terminal))
++		return IRQ_HANDLED;
+ 
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+ 		return IRQ_NONE;
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index be1a9d75..029eab1a 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -533,6 +533,8 @@ struct mt7996_dev {
+ 	struct mutex dump_mutex;
+ 	/* serializes producer quiesce and restore */
+ 	struct mutex npu_stop_mutex;
++	/* serializes IRQ tasklet enable state */
++	struct mutex irq_tasklet_mutex;
+ #ifdef CONFIG_DEV_COREDUMP
+ 	struct {
+ 		struct mt7996_crash_data *crash_data;
+@@ -791,6 +793,9 @@ int mt7996_shutdown_device(struct mt7996_dev *dev);
+ void mt7996_quarantine_device(struct mt7996_dev *dev);
+ void mt7996_npu_pre_stop(struct mt7996_dev *dev);
+ void mt7996_npu_post_reset(struct mt7996_dev *dev);
++void mt7996_irq_tasklet_disable(struct mt7996_dev *dev);
++bool mt7996_irq_tasklet_enable(struct mt7996_dev *dev);
++int mt7996_irq_tasklet_bootstrap(struct mt7996_dev *dev);
+ void mt7996_terminal_quiesce(struct mt7996_dev *dev);
+ void __noreturn mt7996_fence_failed(struct mt7996_dev *dev,
+ 				    const char *phase, int err);
