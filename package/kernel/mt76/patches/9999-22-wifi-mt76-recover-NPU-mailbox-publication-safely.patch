@@ -1,0 +1,190 @@
+From c609463b4d80da0299799a2fe1c9e88dec23a678 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 30 Aug 2026 21:50:09 +0800
+Subject: [PATCH 01/12] wifi: mt76: recover NPU mailbox publication safely
+
+Publish the NPU mailbox pointer only after queue state has been
+restored enough for consumers to use it. Clear stale publication before
+recovery so packet and IRQ paths fail closed while hardware is rebuilt.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ mt7996/npu.c | 49 +++++++++++++++++++++++++++++++++++++++++--------
+ mt7996/pci.c |  6 ++++--
+ npu.c        | 33 ++++++++++++++++++++++++---------
+ 3 files changed, 69 insertions(+), 19 deletions(-)
+
+diff --git a/mt7996/npu.c b/mt7996/npu.c
+index 515a7de..aa56794 100644
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -594,11 +594,11 @@ static int mt7996_npu_prepare_retry(struct mt7996_dev *dev,
+ 	if (err != -ETIMEDOUT)
+ 		return err;
+ 
+-	dev_warn(dev->mt76.dev, "%s timed out, recovering core 0\n",
++	dev_warn(dev->mt76.dev, "%s timed out, recovering mailbox\n",
+ 		 operation);
+-	err = airoha_npu_recover(npu);
++	err = airoha_npu_recover_mailbox(npu);
+ 	if (err)
+-		dev_err(dev->mt76.dev, "failed to recover NPU core 0: %d\n",
++		dev_err(dev->mt76.dev, "failed to recover NPU mailbox: %d\n",
+ 			err);
+ 
+ 	return err;
+@@ -666,11 +666,14 @@ int mt7996_npu_hw_init(struct mt7996_dev *dev)
+ }
+ 
+ static int mt7996_npu_hw_stop_once(struct mt7996_dev *dev,
+-				   struct airoha_npu *npu)
++				   struct airoha_npu *npu,
++				   bool *drain_timeout)
+ {
+ 	int i, err;
+ 	u32 info;
+ 
++	*drain_timeout = false;
++
+ 	err = mt76_npu_send_msg(npu, 4, WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+ 				0, GFP_KERNEL);
+ 	if (err) {
+@@ -694,6 +697,7 @@ static int mt7996_npu_hw_stop_once(struct mt7996_dev *dev,
+ 	if (i == 10) {
+ 		dev_warn(dev->mt76.dev,
+ 			 "NPU drain did not complete, status: %#x\n", info);
++		*drain_timeout = true;
+ 		return -ETIMEDOUT;
+ 	}
+ 
+@@ -709,6 +713,7 @@ static int mt7996_npu_hw_stop_once(struct mt7996_dev *dev,
+ static int __mt7996_npu_hw_stop(struct mt7996_dev *dev, bool recover)
+ {
+ 	struct airoha_npu *npu;
++	bool drain_timeout;
+ 	int err = 0;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+@@ -717,11 +722,19 @@ static int __mt7996_npu_hw_stop(struct mt7996_dev *dev, bool recover)
+ 	if (!npu)
+ 		goto unlock;
+ 
+-	err = mt7996_npu_hw_stop_once(dev, npu);
++	err = mt7996_npu_hw_stop_once(dev, npu, &drain_timeout);
+ 	if (recover && (err == -ETIMEDOUT || err == -EAGAIN)) {
+-		err = mt7996_npu_prepare_retry(dev, npu, err, "NPU stop");
++		if (drain_timeout) {
++			dev_warn(dev->mt76.dev,
++				 "NPU drain timed out, recovering core 0\n");
++			err = airoha_npu_recover(npu);
++		} else {
++			err = mt7996_npu_prepare_retry(dev, npu, err,
++						       "NPU stop");
++		}
+ 		if (!err)
+-			err = mt7996_npu_hw_stop_once(dev, npu);
++			err = mt7996_npu_hw_stop_once(dev, npu,
++						      &drain_timeout);
+ 	}
+ unlock:
+ 	mutex_unlock(&dev->mt76.mutex);
+@@ -736,5 +749,25 @@ int mt7996_npu_hw_stop(struct mt7996_dev *dev)
+ 
+ int mt7996_npu_hw_stop_teardown(struct mt7996_dev *dev)
+ {
+-	return __mt7996_npu_hw_stop(dev, false);
++	struct airoha_npu *npu;
++	int err;
++
++	err = __mt7996_npu_hw_stop(dev, false);
++	if (!err)
++		return 0;
++
++	dev_warn(dev->mt76.dev,
++		 "NPU stop failed: %d; asserting terminal hard stop\n", err);
++
++	mutex_lock(&dev->mt76.mutex);
++	npu = rcu_dereference_protected(dev->mt76.mmio.npu,
++					lockdep_is_held(&dev->mt76.mutex));
++	err = npu ? airoha_npu_hard_stop(npu) : 0;
++	mutex_unlock(&dev->mt76.mutex);
++
++	if (err)
++		dev_err(dev->mt76.dev,
++			"failed to fence NPU DMA with hard stop: %d\n", err);
++
++	return err;
+ }
+diff --git a/mt7996/pci.c b/mt7996/pci.c
+index ae9e3e6..456c65c 100644
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -199,9 +199,11 @@ static int mt7996_pci_probe(struct pci_dev *pdev,
+ 	return 0;
+ 
+ free_hif2_irq:
+-	npu_ret = mt7996_npu_hw_stop(dev);
++	npu_ret = mt7996_npu_hw_stop_teardown(dev);
+ 	if (npu_ret)
+-		dev_warn(mdev->dev, "failed to stop NPU: %d\n", npu_ret);
++		dev_crit(mdev->dev,
++			 "failed to fence NPU DMA during probe unwind: %d\n",
++			 npu_ret);
+ 	mt76_npu_rx_queues_deinit(mdev);
+ 	if (dev->hif2)
+ 		devm_free_irq(mdev->dev, hif2_irq, dev);
+diff --git a/npu.c b/npu.c
+index c6e1c34..d13c44b 100644
+--- a/npu.c
++++ b/npu.c
+@@ -510,15 +510,30 @@ int mt76_npu_send_txrx_addr(struct mt76_dev *dev, int ifindex,
+ 		.out_count_addr = cpu_to_le32(o_count_addr),
+ 	};
+ 	struct airoha_npu *npu;
++	bool retry;
+ 	int err = -ENODEV;
+ 
+-	rcu_read_lock();
+-	npu = rcu_dereference(dev->mmio.npu);
+-	if (npu)
++	mutex_lock(&dev->mutex);
++	npu = rcu_dereference_protected(dev->mmio.npu,
++					lockdep_is_held(&dev->mutex));
++	if (!npu)
++		goto unlock;
++
++	err = airoha_npu_wlan_send_msg(npu, ifindex,
++				       WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++				       &info, sizeof(info), GFP_KERNEL);
++	retry = err == -ETIMEDOUT || err == -EAGAIN;
++	if (err == -EAGAIN)
++		err = airoha_npu_wait_recovery(npu);
++	else if (err == -ETIMEDOUT)
++		err = airoha_npu_recover_mailbox(npu);
++
++	if (retry && !err)
+ 		err = airoha_npu_wlan_send_msg(npu, ifindex,
+-				WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+-				&info, sizeof(info), GFP_ATOMIC);
+-	rcu_read_unlock();
++					       WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++					       &info, sizeof(info), GFP_KERNEL);
++unlock:
++	mutex_unlock(&dev->mutex);
+ 
+ 	return err;
+ }
+@@ -591,10 +606,10 @@ int mt76_npu_init(struct mt76_dev *dev, phys_addr_t phy_addr, int type)
+ 		}
+ 	} else if (err == -ETIMEDOUT) {
+ 		dev_warn(dev->dev,
+-			 "NPU memory initialization timed out, recovering core 0\n");
+-		err = airoha_npu_recover(npu);
++			 "NPU memory initialization timed out, recovering mailbox\n");
++		err = airoha_npu_recover_mailbox(npu);
+ 		if (err) {
+-			dev_err(dev->dev, "failed to recover NPU core 0: %d\n",
++			dev_err(dev->dev, "failed to recover NPU mailbox: %d\n",
+ 				err);
+ 			goto error_ppe_put;
+ 		}
