@@ -1,0 +1,32 @@
+From ece75e856fc6477fe9a75c87ee2c61b61a216e2e Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:29:12 +0800
+Subject: [PATCH 6/6] net: airoha: unwind failed phylink opens
+
+If airoha_set_vip_for_gdm_port() fails during device open, phylink has
+already been connected and started. Stop queues and disconnect phylink on
+that error path so the next open starts from a clean state.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 7a08a4280..fbf7a8705 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2559,8 +2559,12 @@ static int airoha_dev_open(struct net_device *netdev)
+ 
+ 	netif_tx_start_all_queues(netdev);
+ 	err = airoha_set_vip_for_gdm_port(dev, true);
+-	if (err)
++	if (err) {
++		netif_tx_disable(netdev);
++		phylink_stop(dev->phylink);
++		phylink_disconnect_phy(dev->phylink);
+ 		return err;
++	}
+ 
+ 	/* It seems GDM3 and GDM4 needs SPORT enabled to correctly work */
+ 	if (netdev_uses_dsa(netdev) || port->id > 2)
