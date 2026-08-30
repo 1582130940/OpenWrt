@@ -1,0 +1,45 @@
+From 2f46ad0788cb457bf8458258ac03320c2d4ab107 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:29:12 +0800
+Subject: [PATCH 4/6] net: pcs: airoha: replay in-band USXGMII link speed
+
+For USXGMII, phylink passes link_up the speed resolved by in-band
+negotiation. Program that resolved speed so 1G, 2.5G, 5G, and 10G mode
+changes update both the PCS mode and rate-adaptation registers, and keep
+XFI pause controlled by the PCS config path.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index d73d280b1..5fd8cc237 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1115,7 +1115,11 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR, 0x5));
+ 	}
+ 
+-	if (neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
++	/* USXGMII link_up carries the speed resolved by in-band AN. Forced
++	 * interfaces retain their existing neg_mode gate.
++	 */
++	if (interface == PHY_INTERFACE_MODE_USXGMII ||
++	    neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
+ 		int ret = 0;
+ 
+ 		switch (interface) {
+@@ -1242,12 +1246,6 @@ static int airoha_pcs_post_config(struct phylink_pcs *pcs,
+ 			   AIROHA_PCS_XFI_IPG_NUM,
+ 			   FIELD_PREP(AIROHA_PCS_XFI_IPG_NUM, 10));
+ 
+-	/* Enable TX/RX flow control */
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			AIROHA_PCS_XFI_TX_FC_EN);
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			AIROHA_PCS_XFI_RX_FC_EN);
+-
+ 	if (recovery) {
+ 		if (recovery->config_pending) {
+ 			recovery->post_config_done = true;
