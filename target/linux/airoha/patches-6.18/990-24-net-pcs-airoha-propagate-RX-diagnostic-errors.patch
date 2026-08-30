@@ -1,0 +1,74 @@
+From f73569c1329e3d34217e1033360a3198fcf579e8 Mon Sep 17 00:00:00 2001
+From: HandSonic <8078023+handsonic@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:29:12 +0800
+Subject: [PATCH 1/6] net: pcs: airoha: propagate RX diagnostic errors
+
+The AN7581 RX-lock workaround used register values even when regmap
+access failed. Keep signal absence distinct from I/O failure so callers
+report link down for the current poll instead of accepting an invalid
+sample.
+
+Signed-off-by: HandSonic <8078023+handsonic@users.noreply.github.com>
+---
+ drivers/net/pcs/airoha/pcs-an7581.c | 29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-an7581.c b/drivers/net/pcs/airoha/pcs-an7581.c
+index c6e9d47fd..f36838c49 100644
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -2033,20 +2033,24 @@ int an7581_pcs_pcie_alloc_regmap_fields(struct airoha_pcs_priv *priv)
+ 	return __an7581_pcs_alloc_regmap_fields(priv, 1, an7581_pcs_pcie1_fields);
+ }
+ 
+-static bool an7581_pcs_have_rx_signal(struct airoha_pcs_priv *priv, int index)
++static int an7581_pcs_have_rx_signal(struct airoha_pcs_priv *priv, int index)
+ {
+ 	struct regmap *pcs_pma = priv->pcs_pma[index];
+ 	unsigned int count = 0;
+-	u32 val;
+-	int i;
++	u32 val = 0;
++	int i, ret;
+ 
+-	regmap_write(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
+-		     AIROHA_PCS_TRIGGER_RX_SIDGET_SCAN);
++	ret = regmap_write(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
++			   AIROHA_PCS_TRIGGER_RX_SIDGET_SCAN);
++	if (ret)
++		return ret;
+ 
+ 	/* Scan 5 times for RX sigdet module to detect RX signal */
+ 	for (i = 0; i <= 5; i++) {
+-		regmap_read(pcs_pma, AIROHA_PCS_PMA_DIG_RO_RESERVE_2,
+-			    &val);
++		ret = regmap_read(pcs_pma, AIROHA_PCS_PMA_DIG_RO_RESERVE_2,
++				  &val);
++		if (ret)
++			return ret;
+ 		if (val & AIROHA_PCS_RX_SIGDET)
+ 			count++;
+ 	}
+@@ -2088,14 +2092,19 @@ static void an7581_pcs_report_rxlock(struct airoha_pcs_priv *priv, int index,
+ int an7581_pcs_rxlock_workaround(struct airoha_pcs_priv *priv, int index)
+ {
+ 	struct airoha_pcs_maps *maps = &priv->maps[index];
+-	bool signal;
+-	u32 val;
++	u32 val = 0;
++	int ret, signal;
+ 
+ 	/* Check if PCS is UP or Down */
+-	regmap_read(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_STUS_1, &val);
++	ret = regmap_read(maps->usxgmii_pcs,
++			  AIROHA_PCS_USXGMII_PCS_STUS_1, &val);
++	if (ret)
++		return ret;
+ 	if (val & AIROHA_PCS_USXGMII_PCS_RX_LINK_STATUS_UP)
+ 		return 0;
+ 
+ 	signal = an7581_pcs_have_rx_signal(priv, index);
++	if (signal < 0)
++		return signal;
+ 	if (!signal)
+ 		return 0;
