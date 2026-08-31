@@ -1,0 +1,124 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] net: airoha: ppe: verify skb tuple before bridge subflow bind
+
+airoha_ppe_foe_insert_entry() falls back to committing a bridge subflow
+built from the current skb into the FOE entry addressed by the PPE hash.
+With a busy bridge the PPE hash can collide across flows; in that case
+the fallback overwrites the L2/binding of an unrelated flow, producing
+mis-bound entries (e.g. a WAN/NAT flow showing a WLAN egress binding to
+an arbitrary STA).  This is particularly visible after a WiFi STA
+disconnect/reconnect while the flowtable is churning.
+
+Only commit the bridge subflow when the skb 5-tuple actually matches the
+FOE entry being bound.  Non-IP (L2 bridge) entries are unaffected.
+
+Includes dynamic-debug traces for unbind hits/commits to confirm the
+WLAN RX (STA->AP) path after a STA reconnect.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 71 +++++++++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-08-20 19:43:56.294495912 +0800
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-08-20 19:44:26.061035383 +0800
+@@ -11,6 +11,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
++#include <net/flow_dissector.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+ #include <net/pkt_cls.h>
+@@ -1088,6 +1089,59 @@
+ 	return err;
+ }
+ 
++static bool airoha_ppe_foe_entry_match_skb(struct airoha_foe_entry *hwe,
++					   struct sk_buff *skb)
++{
++	struct flow_keys keys;
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++
++	switch (type) {
++	case PPE_PKT_TYPE_IPV4_HNAPT:
++	case PPE_PKT_TYPE_IPV4_ROUTE: {
++		const struct airoha_foe_ipv4_tuple *t = &hwe->ipv4.orig_tuple;
++
++		if (!skb_flow_dissect_flow_keys(skb, &keys, 0))
++			return false;
++		if (keys.basic.n_proto != htons(ETH_P_IP))
++			return false;
++		if (t->src_ip != be32_to_cpu(keys.addrs.v4addrs.src) ||
++		    t->dest_ip != be32_to_cpu(keys.addrs.v4addrs.dst))
++			return false;
++		if (type == PPE_PKT_TYPE_IPV4_ROUTE)
++			return t->protocol == keys.basic.ip_proto;
++		if (keys.basic.ip_proto != IPPROTO_TCP &&
++		    keys.basic.ip_proto != IPPROTO_UDP)
++			return true;
++		return t->src_port == ntohs(keys.ports.src) &&
++		       t->dest_port == ntohs(keys.ports.dst);
++	}
++	case PPE_PKT_TYPE_IPV6_ROUTE_3T:
++	case PPE_PKT_TYPE_IPV6_ROUTE_5T: {
++		const struct airoha_foe_ipv6 *ip6 = &hwe->ipv6;
++		int i;
++
++		if (!skb_flow_dissect_flow_keys(skb, &keys, 0))
++			return false;
++		if (keys.basic.n_proto != htons(ETH_P_IPV6))
++			return false;
++		for (i = 0; i < 4; i++) {
++			if (ip6->src_ip[i] != be32_to_cpu(keys.addrs.v6addrs.src.s6_addr32[i]) ||
++			    ip6->dest_ip[i] != be32_to_cpu(keys.addrs.v6addrs.dst.s6_addr32[i]))
++				return false;
++		}
++		if (type == PPE_PKT_TYPE_IPV6_ROUTE_3T)
++			return true;
++		if (keys.basic.ip_proto != IPPROTO_TCP &&
++		    keys.basic.ip_proto != IPPROTO_UDP)
++			return true;
++		return ip6->src_port == ntohs(keys.ports.src) &&
++		       ip6->dest_port == ntohs(keys.ports.dst);
++	}
++	default:
++		return true;
++	}
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan)
+@@ -1114,6 +1168,9 @@
+ 	if (state == AIROHA_FOE_STATE_BIND)
+ 		goto unlock;
+ 
++	pr_debug_ratelimited("airoha_ppe: unbind hit hash=%04x rx_wlan=%d state=%u bridge=%d\n",
++			     hash, rx_wlan, state, bridge_ready);
++
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+ 		if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+@@ -1129,6 +1186,8 @@
+ 			continue;
+ 
+ 		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++		pr_debug_ratelimited("airoha_ppe: commit flow hash=%04x rx_wlan=%d\n",
++				     hash, rx_wlan);
+ 		commit_done = true;
+ 		e->hash = hash;
+ 	}
+@@ -1136,6 +1195,12 @@
+ 	if (commit_done)
+ 		goto unlock;
+ 
++	if (!airoha_ppe_foe_entry_match_skb(hwe, skb)) {
++		pr_debug_ratelimited("airoha_ppe: skip bridge bind at hash %04x (tuple mismatch)\n",
++				     hash);
++		goto unlock;
++	}
++
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
