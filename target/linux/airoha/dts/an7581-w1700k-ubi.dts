@@ -362,6 +362,7 @@
 			reset-gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
 			reset-assert-us = <200000>;
 			reset-deassert-us = <200000>;
+			reset-before-id-read;
 			// interrupt-parent = <&en7581_pinctrl>;
 			// interrupts = <22 IRQ_TYPE_LEVEL_LOW>;
 			realtek,sds-mode = <0x88c6>;
