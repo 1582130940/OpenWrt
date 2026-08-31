@@ -1,0 +1,84 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] net: airoha: ppe: dissect early RX skb from Ethernet header
+
+The PPE unbind callback runs from the NPU/WED RX path before
+eth_type_trans(). At that point skb->data and the MAC header already point
+to the translated Ethernet frame, but skb->protocol and the network header
+have not been initialized yet.
+
+airoha_ppe_foe_entry_match_skb() consequently asks the flow dissector to
+parse protocol 0 at an invalid network offset and rejects a matching flow.
+This prevents the bridge-FDB fallback from binding WLAN uplink flows after
+their flowtable state is removed on station disconnect.
+
+Temporarily initialize the protocol and network header from the Ethernet
+frame while dissecting. Restore both fields afterwards because the skb
+still has to pass through the normal receive path and eth_type_trans().
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 37 +++++++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1089,6 +1089,39 @@ airoha_ppe_foe_prepare_bridge_subflow(struct airoha_ppe *ppe,
+ 	return err;
+ }
+ 
++static bool airoha_ppe_flow_keys(struct sk_buff *skb,
++				 struct flow_keys *keys)
++{
++	__be16 protocol = skb->protocol;
++	u16 network_header = skb->network_header;
++	struct ethhdr _eh, *eh;
++	bool ret;
++
++	if (protocol)
++		return skb_flow_dissect_flow_keys(skb, keys, 0);
++
++	/* NPU/WED invokes the PPE callback before eth_type_trans(), so the
++	 * translated Ethernet header is present while the protocol metadata
++	 * needed by the flow dissector is not.
++	 */
++	if (skb_mac_header(skb) != skb->data)
++		return false;
++
++	eh = skb_header_pointer(skb, 0, sizeof(_eh), &_eh);
++	if (!eh)
++		return false;
++
++	skb->protocol = eh->h_proto;
++	skb_set_network_header(skb, ETH_HLEN);
++
++	ret = skb_flow_dissect_flow_keys(skb, keys, 0);
++
++	skb->protocol = protocol;
++	skb->network_header = network_header;
++
++	return ret;
++}
++
+ static bool airoha_ppe_foe_entry_match_skb(struct airoha_foe_entry *hwe,
+ 					   struct sk_buff *skb)
+ {
+@@ -1099,7 +1132,7 @@ static bool airoha_ppe_foe_entry_match_skb(struct airoha_foe_entry *hwe,
+ 	case PPE_PKT_TYPE_IPV4_ROUTE: {
+ 		const struct airoha_foe_ipv4_tuple *t = &hwe->ipv4.orig_tuple;
+ 
+-		if (!skb_flow_dissect_flow_keys(skb, &keys, 0))
++		if (!airoha_ppe_flow_keys(skb, &keys))
+ 			return false;
+ 		if (keys.basic.n_proto != htons(ETH_P_IP))
+ 			return false;
+@@ -1119,7 +1152,7 @@ static bool airoha_ppe_foe_entry_match_skb(struct airoha_foe_entry *hwe,
+ 		const struct airoha_foe_ipv6 *ip6 = &hwe->ipv6;
+ 		int i;
+ 
+-		if (!skb_flow_dissect_flow_keys(skb, &keys, 0))
++		if (!airoha_ppe_flow_keys(skb, &keys))
+ 			return false;
+ 		if (keys.basic.n_proto != htons(ETH_P_IPV6))
+ 			return false;
+-- 
+2.51.0
