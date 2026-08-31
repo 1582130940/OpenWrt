@@ -1,0 +1,113 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] netfilter: nf_flow_table: scope roaming cleanup to the source port
+
+990-01's FDB-roaming cleanup had two problems:
+
+1. nf_flow_table_do_cleanup_mac() matched flows only by destination MAC.
+   The cleanup work is queued asynchronously per SWITCHDEV_FDB_DEL, so
+   when a STA roams away from SSID-B back to SSID-A, a delayed cleanup(B)
+   still matched the freshly re-created SSID-A flows by MAC and tore them
+   down (async race; reproduction depends on FDB DEL/ADD, flow creation
+   and workqueue ordering).
+
+2. nf_flow_table_mac_cleanup_work() unconditionally ran
+   nf_flow_table_offload_flush() for every MAC cleanup, nuking *all*
+   hardware-offloaded flows in every flowtable, including healthy
+   unrelated uplink flows.  After a disconnect this could race with flow
+   re-creation and leave uplink (STA->AP) FOE entries unbound.
+
+Fix both:
+- Record the ifindex of the port that emitted the FDB DEL.
+- Match flows on destination MAC AND output ifindex (out.ifidx), so a
+  delayed cleanup for an old port never touches flows that now egress
+  through a different port.
+- Drop the unconditional per-MAC nf_flow_table_offload_flush(); the
+  MAC+port matched flows are already torn down precisely.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ net/netfilter/nf_flow_table_core.c | 22 ++++++++++++++++------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -27,6 +27,7 @@ struct flow_mac_cleanup {
+ 	struct work_struct work;
+ 	struct net *net;
+ 	unsigned char mac[ETH_ALEN];
++	int ifindex;
+ };
+ #endif
+ 
+@@ -777,6 +778,15 @@ void nf_flow_table_cleanup(struct net_device *dev)
+ EXPORT_SYMBOL_GPL(nf_flow_table_cleanup);
+ 
+ #if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++static bool
++nf_flow_tuple_matches_cleanup(const struct flow_offload_tuple *t,
++			      const struct flow_mac_cleanup *cleanup)
++{
++	return t->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
++	       ether_addr_equal(t->out.h_dest, cleanup->mac) &&
++	       t->out.ifidx == cleanup->ifindex;
++}
++
+ static void nf_flow_table_do_cleanup_mac(struct nf_flowtable *flowtable,
+ 					 struct flow_offload *flow, void *data)
+ {
+@@ -786,10 +796,8 @@ static void nf_flow_table_do_cleanup_mac(struct nf_flowtable *flowtable,
+ 	if (!net_eq(nf_ct_net(flow->ct), cleanup->net))
+ 		return;
+ 
+-	if ((flow->tuplehash[0].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
+-	     ether_addr_equal(flow->tuplehash[0].tuple.out.h_dest, cleanup->mac)) ||
+-	    (flow->tuplehash[1].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
+-	     ether_addr_equal(flow->tuplehash[1].tuple.out.h_dest, cleanup->mac))) {
++	if (nf_flow_tuple_matches_cleanup(&flow->tuplehash[0].tuple, cleanup) ||
++	    nf_flow_tuple_matches_cleanup(&flow->tuplehash[1].tuple, cleanup)) {
+ 		if (t->l3proto == NFPROTO_IPV4)
+ 			pr_debug("nf_flow_table: teardown flow %pI4:%u->%pI4:%u proto=%u for roaming mac=%pM\n",
+ 				 &t->src_v4, ntohs(t->src_port),
+@@ -819,10 +827,11 @@ static void nf_flow_table_mac_cleanup_work(struct work_struct *work)
+ 			nf_flow_table_iterate(flowtable,
+ 						  nf_flow_table_do_cleanup_mac, cleanup);
+ 
+-		/* do this implicitly.. it seems to help expire software path
+-		 * entries faster but still need to get concrete data */
++		/* Accelerate expiry of the torn-down flows without flushing
++		 * every hardware-offloaded flow in the table: an FDB DEL for
++		 * one STA must not nuke unrelated flows (this was racing with
++		 * flow re-creation after a roam/reconnect). */
+ 		flush_delayed_work(&flowtable->gc_work);
+-		nf_flow_table_offload_flush(flowtable);
+ 	}
+ 	mutex_unlock(&flowtable_lock);
+ 
+@@ -833,7 +842,8 @@ static void nf_flow_table_mac_cleanup_work(struct work_struct *work)
+ 	kfree(cleanup);
+ }
+ 
+-static void nf_flow_table_cleanup_mac(struct net *net, const unsigned char *mac)
++static void nf_flow_table_cleanup_mac(struct net *net,
++				     const unsigned char *mac, int ifindex)
+ {
+ 	struct flow_mac_cleanup *cleanup;
+ 
+@@ -843,6 +853,7 @@ static void nf_flow_table_cleanup_mac(struct net *net, const unsigned char *mac)
+ 
+ 	cleanup->net = get_net(net);
+ 	memcpy(cleanup->mac, mac, ETH_ALEN);
++	cleanup->ifindex = ifindex;
+ 	INIT_WORK(&cleanup->work, nf_flow_table_mac_cleanup_work);
+ 	queue_work(flow_mac_cleanup_wq, &cleanup->work);
+ }
+@@ -876,7 +887,7 @@ static int nf_flow_table_switchdev_event(struct notifier_block *nb,
+ 	pr_debug("nf_flow_table: FDB roaming detected del mac=%pM from port=%s\n",
+ 		fdb_info->addr, dev->name);
+ 
+-	nf_flow_table_cleanup_mac(dev_net(dev), fdb_info->addr);
++	nf_flow_table_cleanup_mac(dev_net(dev), fdb_info->addr, dev->ifindex);
+ 	return NOTIFY_DONE;
+ }
+ 
