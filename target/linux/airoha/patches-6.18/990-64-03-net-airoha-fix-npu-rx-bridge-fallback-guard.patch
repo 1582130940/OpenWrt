@@ -1,0 +1,68 @@
+From: dsanke <dsanke1997@gmail.com>
+Subject: [PATCH] net: airoha: fix bridge-fallback guard killing NPU RX binds
+
+The host-destined exclusion added for the PPE bridge fallback checked
+skb->pkt_type == PACKET_HOST.  On the NPU/WED and wired DMA RX paths the
+skb is built by napi_build_skb() and pkt_type keeps its PACKET_HOST
+default until eth_type_trans() classifies the frame later inside
+__netif_receive_skb_core(), which happens after the driver already
+invoked airoha_ppe_check_skb().  As a result every WLAN uplink
+(STA->AP) frame looked host-destined, airoha_ppe_foe_prepare_bridge_subflow()
+always returned false and the bridge-FDB fallback never ran.  Once the
+flowtable entries for a STA are torn down on disconnect (FDB roaming
+invalidation), a reconnecting STA's uplink flows could never be re-bound:
+the flowtable/l2_flows path was gone and the FDB fallback was dead,
+leaving uplink FOE entries UNB.  Downlink kept working because it binds
+through the flowtable WDMA path.
+
+Drop the pkt_type test and keep the real host-destined exclusion
+(destination MAC equal to the bridge master's own MAC; the bridge FDB
+also refuses to resolve local entries, so this is belt-and-suspenders).
+
+Also skip the fallback when the FDB resolves the destination to the same
+ingress interface (intra-BSS on an AP, or a port self-loop on a GDM
+netdev): such traffic stays in the software/WLAN datapath and must not
+be offloaded to a WDMA/GDM egress.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1016,9 +1016,15 @@ airoha_ppe_foe_prepare_bridge_subflow(struct airoha_ppe *ppe,
+ 	 * path for the bridge's own MAC, but make the exclusion explicit so
+ 	 * a stray FDB/PPE classification can never offload host-bound flows
+ 	 * into hardware and black-hole them.
++	 *
++	 * Note: skb->pkt_type cannot be used here.  On the NPU/WED and wired
++	 * DMA RX paths the skb is built by napi_build_skb() and pkt_type
++	 * keeps its PACKET_HOST default until eth_type_trans() classifies
++	 * the frame later in __netif_receive_skb_core(), i.e. after the PPE
++	 * check already ran.  Every uplink frame would therefore look
++	 * host-destined and the bridge fallback would never fire.
+ 	 */
+-	if (skb->pkt_type == PACKET_HOST ||
+-	    ether_addr_equal(eh->h_dest, master->dev_addr)) {
++	if (ether_addr_equal(eh->h_dest, master->dev_addr)) {
+ 		dev_put(master);
+ 		return false;
+ 	}
+@@ -1078,6 +1084,15 @@ airoha_ppe_foe_prepare_bridge_subflow(struct airoha_ppe *ppe,
+ 		dev_put(master);
+ 		return false;
+ 	}
++	/* Same-interface forwarding (intra-BSS on an AP, or a port self-loop
++	 * on a GDM netdev) stays in the software/WLAN datapath: binding it to
++	 * a WDMA/GDM egress would fight the 802.11/bridge driver path.
++	 */
++	if (egress == skb->dev) {
++		rcu_read_unlock();
++		dev_put(master);
++		return false;
++	}
+ 	dev_hold(egress);
+ 	rcu_read_unlock();
+ 
