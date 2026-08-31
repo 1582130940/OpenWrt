@@ -365,6 +365,7 @@
 			// interrupt-parent = <&en7581_pinctrl>;
 			// interrupts = <22 IRQ_TYPE_LEVEL_LOW>;
 			realtek,sds-mode = <0x88c6>;
+			realtek,patch-rtk-serdes;
 			tx-polarity = <PHY_POL_INVERT>;
 			rx-polarity = <PHY_POL_INVERT>;
 		};
