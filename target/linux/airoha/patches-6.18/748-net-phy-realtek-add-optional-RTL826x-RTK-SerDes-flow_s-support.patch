@@ -1,0 +1,338 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: phy: realtek: add optional RTL826x RTK SerDes flow_s support
+
+The Realtek SDK applies additional host SerDes writes on platforms that
+require the RTK SerDes flow_s tuning sequence. Support for selecting this
+sequence was present in the original RTL826x driver conversion, but was
+not retained when the driver was integrated for Linux 6.18.
+
+Restore the board opt-in realtek,patch-rtk-serdes property and append the
+two PSDS0 tuning operations after the common firmware patch table. Keep
+this sequence opt-in because it is not valid for every RTL826x host.
+
+When the option is enabled, pulse SDS 7.0x10 through 0x8003 after copper
+auto-negotiation before restoring the board's final 0x80aa value, then
+restore SDS 6.0x12 to 0x5078. Keep the intermediate value active for
+10-12 ms, and use the attached netdev carrier state as feedback before
+retrying. This lets affected boards refresh the in-band word seen by the
+MAC PCS without adding Airoha-specific MMIO reads or reset sequencing to
+the Realtek PHY driver.
+
+Link: https://github.com/openwrt/openwrt/commit/46d81ac28caf2e0018089da921e9ae953f6dd3d2
+Co-developed-by: Balázs Triszka <info@balika011.hu>
+Signed-off-by: Balázs Triszka <info@balika011.hu>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml |  6 +
+ drivers/net/phy/realtek/phy_patch_rtl826x.c                | 64 ++++++++++-
+ drivers/net/phy/realtek/phy_patch_rtl826x.h                |  1 +
+ drivers/net/phy/realtek/realtek.h                          | 11 ++
+ drivers/net/phy/realtek/realtek_main.c                     | 99 +++++++++++++++-
+ 5 files changed, 177 insertions(+), 4 deletions(-)
+
+--- a/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml
++++ b/Documentation/devicetree/bindings/net/realtek,rtl82xx.yaml
+@@ -57,6 +57,12 @@ properties:
+       Board-specific 16-bit host SerDes mode programmed into SDS page 6,
+       register 3 after the RTL825x/RTL826x firmware initialization sequence.
+ 
++  realtek,patch-rtk-serdes:
++    type: boolean
++    description: |
++      Apply the optional RTL826x RTK host SerDes flow_s tuning sequence
++      after firmware loading and copper auto-negotiation.
++
+   wakeup-source:
+     type: boolean
+     description:
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.c
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.c
+@@ -117,6 +117,36 @@ static int rtl826x_phy_patch_sds_modify(
+ 	return rtl826x_phy_patch_sds_set(phydev, sds_page, sds_reg, (ret & ~mask) | data);
+ }
+ 
++int rtl826x_phy_patch_rtk_serdes(struct phy_device *phydev)
++{
++	struct rtl826x_priv *priv = phydev->priv;
++	int ret;
++
++	if (!priv || !priv->patch_rtk_serdes)
++		return 0;
++
++	/* A value transition is intentional even when the final value already
++	 * matches. Keep 0x8003 active long enough for the Host AN state to
++	 * settle before restoring the tuned value. Do not reset the running
++	 * DTE XS.
++	 */
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x07, 0x10, 0x8003);
++	if (ret < 0)
++		return ret;
++
++	usleep_range(10000, 12000);
++
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x07, 0x10, 0x80aa);
++	if (ret < 0)
++		return ret;
++
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x06, 0x12, 0x5078);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
+ static int rtl826x_phy_patch_op(struct phy_device *phydev, const struct rtlgen_hwpatch *patch)
+ {
+ 	u32 mask = GENMASK(patch->msb, patch->lsb);
+@@ -230,6 +260,6 @@ static int rtl826x_phy_patch_db_init(str
+ 	struct rtlgen_hwpatch *patches;
+ 	const struct firmware *fw;
+-	size_t count;
++	size_t count, extra_count, total_count;
+ 	int ret;
+ 
+ 	ret = request_firmware_direct(&fw, fw_name, dev);
+@@ -248,17 +278,43 @@ static int rtl826x_phy_patch_db_init(str
+ 
+ 	patches = (struct rtlgen_hwpatch *)fw->data;
+ 	count = fw->size / sizeof(*patches);
++	extra_count = priv->patch_rtk_serdes ? 2 : 0;
++	if (check_add_overflow(count, extra_count, &total_count)) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
+ 
+-	patch_db = devm_kzalloc(dev, struct_size(patch_db, conf, count), GFP_KERNEL);
++	patch_db = devm_kzalloc(dev, struct_size(patch_db, conf, total_count),
++				GFP_KERNEL);
+ 	if (!patch_db) {
+ 		ret = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+-	patch_db->count = count;
++	patch_db->count = total_count;
+ 	patch_db->patch_op_exec = rtl826x_phy_patch_op;
+ 
+ 	memcpy(patch_db->conf, patches, flex_array_size(patch_db, conf, count));
++	if (priv->patch_rtk_serdes) {
++		patch_db->conf[count] = (struct rtlgen_hwpatch) {
++			.patch_op = RTK_PATCH_OP_PSDS0,
++			.portmask = 0xff,
++			.pagemmd = cpu_to_le16(0x07),
++			.addr = cpu_to_le16(0x10),
++			.msb = 15,
++			.lsb = 0,
++			.data = cpu_to_le16(0x80aa),
++		};
++		patch_db->conf[count + 1] = (struct rtlgen_hwpatch) {
++			.patch_op = RTK_PATCH_OP_PSDS0,
++			.portmask = 0xff,
++			.pagemmd = cpu_to_le16(0x06),
++			.addr = cpu_to_le16(0x12),
++			.msb = 15,
++			.lsb = 0,
++			.data = cpu_to_le16(0x5078),
++		};
++	}
+ 
+ 	priv->patch = patch_db;
+ 
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.h
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.h
+@@ -5,11 +5,12 @@
+ 
+ #include <linux/phy.h>
+ 
+ int rtl826x_phy_patch_sds_get(struct phy_device *phydev, u32 sds_page,
+ 			      u32 sds_reg);
+ int rtl826x_phy_patch_sds_set(struct phy_device *phydev, u32 sds_page,
+ 			      u32 sds_reg, u32 data);
++int rtl826x_phy_patch_rtk_serdes(struct phy_device *phydev);
+ int rtl8261n_phy_patch_db_init(struct phy_device *phydev);
+ int rtl8264b_phy_patch_db_init(struct phy_device *phydev);
+ 
+ #endif
+--- a/drivers/net/phy/realtek/realtek.h
++++ b/drivers/net/phy/realtek/realtek.h
+@@ -8,9 +8,20 @@
+ #include "phy_patch.h"
+ #include "phy_patch_rtl826x.h"
+ 
++enum rtl826x_rtk_serdes_state {
++	RTL826X_RTK_SERDES_IDLE,
++	RTL826X_RTK_SERDES_PULSE,
++	RTL826X_RTK_SERDES_RELEASE,
++	RTL826X_RTK_SERDES_CHECK_CARRIER,
++};
++
+ struct rtl826x_priv {
+ 	struct rtlgen_phy_patch_db *patch;
++	enum rtl826x_rtk_serdes_state rtk_serdes_state;
++	u32 rtk_serdes_pulse_count;
++	u8 rtk_serdes_carrier_polls;
+ 	bool enable_pma_low_power:1;
++	bool patch_rtk_serdes:1;
+ };
+ 
+ int rtl822x_hwmon_init(struct phy_device *phydev);
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -23,6 +23,9 @@
+ 
+ #include "realtek.h"
+ 
++/* Let the HZ-driven PCS poll observe the new in-band word before retrying. */
++#define RTL826X_RTK_SERDES_CARRIER_GRACE_POLLS	120
++
+ #define RTL8201F_IER				0x13
+ 
+ #define RTL8201F_ISR				0x1e
+@@ -2537,6 +2540,10 @@ static int rtl826x_probe(struct phy_devi
+ 		return -ENOMEM;
+ 
+ 	priv->enable_pma_low_power = device_property_read_bool(dev, "realtek,enable-pma-low-power");
++	priv->patch_rtk_serdes =
++		device_property_read_bool(dev, "realtek,patch-rtk-serdes");
++	if (priv->patch_rtk_serdes)
++		priv->rtk_serdes_state = RTL826X_RTK_SERDES_PULSE;
+ 	phydev->priv = priv;
+ 
+ 	if (!priv->enable_pma_low_power)
+@@ -2744,11 +2751,17 @@ static int rtl825xb_get_features(struct
+ 
+ static int rtl826x_config_aneg(struct phy_device *phydev)
+ {
++	struct rtl826x_priv *priv = phydev->priv;
+ 	bool changed = false;
+ 	u16 reg;
+ 	int ret;
+ 
+ 	phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
++	if (priv && priv->patch_rtk_serdes) {
++		priv->rtk_serdes_state = RTL826X_RTK_SERDES_PULSE;
++		priv->rtk_serdes_pulse_count = 0;
++		priv->rtk_serdes_carrier_polls = 0;
++	}
+ 	if (phydev->autoneg == AUTONEG_DISABLE)
+ 		return genphy_c45_pma_setup_forced(phydev);
+ 
+@@ -2777,8 +2790,33 @@ static int rtl826x_config_aneg(struct ph
+ 	return genphy_c45_check_and_restart_aneg(phydev, changed);
+ }
+ 
++static int rtl826x_rtk_serdes_pulse(struct phy_device *phydev)
++{
++	struct rtl826x_priv *priv = phydev->priv;
++	int ret;
++
++	ret = rtl826x_phy_patch_rtk_serdes(phydev);
++	if (ret < 0)
++		return ret;
++
++	priv->rtk_serdes_pulse_count++;
++	if (priv->rtk_serdes_pulse_count == 1)
++		phydev_info(phydev,
++			    "pulsed RTK SerDes flow_s 0x8003->0x80aa/0x5078 after copper AN\n");
++	else
++		phydev_dbg(phydev, "repeated RTK SerDes flow_s pulse %u\n",
++			   priv->rtk_serdes_pulse_count);
++
++	priv->rtk_serdes_state = RTL826X_RTK_SERDES_RELEASE;
++	priv->rtk_serdes_carrier_polls = 0;
++
++	return 0;
++}
++
+ static int rtl826x_read_status(struct phy_device *phydev)
+ {
++	struct rtl826x_priv *priv = phydev->priv;
++	bool aneg_done = phydev->autoneg == AUTONEG_DISABLE;
+ 	int status;
+ 	int ret;
+ 
+@@ -2811,7 +2849,83 @@ static int rtl826x_read_status(struct ph
+ 		}
+ 	}
+ 
+-	return genphy_c45_read_mdix(phydev);
++	ret = genphy_c45_read_mdix(phydev);
++	if (ret)
++		return ret;
++
++	if (!priv || !priv->patch_rtk_serdes)
++		return 0;
++
++	if (!aneg_done) {
++		ret = genphy_c45_aneg_done(phydev);
++		if (ret < 0)
++			return ret;
++		aneg_done = ret > 0;
++	}
++
++	if (!phydev->link) {
++		if (priv->rtk_serdes_state == RTL826X_RTK_SERDES_IDLE) {
++			priv->rtk_serdes_state = RTL826X_RTK_SERDES_PULSE;
++			priv->rtk_serdes_pulse_count = 0;
++			priv->rtk_serdes_carrier_polls = 0;
++		}
++
++		if (!aneg_done || priv->rtk_serdes_state == RTL826X_RTK_SERDES_PULSE) {
++			priv->rtk_serdes_carrier_polls = 0;
++			return 0;
++		}
++	}
++
++	if (priv->rtk_serdes_state == RTL826X_RTK_SERDES_IDLE) {
++		if (!phydev->attached_dev ||
++		    netif_carrier_ok(phydev->attached_dev))
++			return 0;
++
++		phydev_info(phydev,
++			    "netdev carrier lost with copper link up, restarting RTK SerDes\n");
++		priv->rtk_serdes_state = RTL826X_RTK_SERDES_PULSE;
++		priv->rtk_serdes_pulse_count = 0;
++		priv->rtk_serdes_carrier_polls = 0;
++	}
++
++	if (!aneg_done) {
++		phydev->link = false;
++		return 0;
++	}
++
++	switch (priv->rtk_serdes_state) {
++	case RTL826X_RTK_SERDES_PULSE:
++		return rtl826x_rtk_serdes_pulse(phydev);
++	case RTL826X_RTK_SERDES_RELEASE:
++		priv->rtk_serdes_state = RTL826X_RTK_SERDES_CHECK_CARRIER;
++		priv->rtk_serdes_carrier_polls = 0;
++		return 0;
++	case RTL826X_RTK_SERDES_CHECK_CARRIER:
++		if (!phydev->attached_dev) {
++			priv->rtk_serdes_state = RTL826X_RTK_SERDES_IDLE;
++			return 0;
++		}
++
++		if (netif_carrier_ok(phydev->attached_dev)) {
++			phydev_info(phydev,
++				    "RTK SerDes carrier recovered after %u flow_s pulse(s)\n",
++				    priv->rtk_serdes_pulse_count);
++			priv->rtk_serdes_state = RTL826X_RTK_SERDES_IDLE;
++			return 0;
++		}
++
++		if (priv->rtk_serdes_carrier_polls++ <
++		    RTL826X_RTK_SERDES_CARRIER_GRACE_POLLS)
++			return 0;
++
++		priv->rtk_serdes_carrier_polls = 0;
++
++		return rtl826x_rtk_serdes_pulse(phydev);
++	case RTL826X_RTK_SERDES_IDLE:
++		return 0;
++	}
++
++	return 0;
+ }
+ 
+ static int rtl826x_config_intr(struct phy_device *phydev)
