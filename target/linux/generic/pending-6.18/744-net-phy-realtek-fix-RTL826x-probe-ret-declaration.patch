@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 1582130940 <19632674+1582130940@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 00:00:00 +0000
+Subject: [PATCH] net: phy: realtek: fix RTL826x probe ret declaration
+
+The RTL8261N USXGMII SerDes reset workaround registers a devm cleanup
+action from rtl826x_probe() and stores the result in ret, but the probe
+local declaration was not added.
+
+Add the missing local variable so the pending patch stack builds until
+upstream carries the same fix.
+
+Signed-off-by: 1582130940 <19632674+1582130940@users.noreply.github.com>
+---
+ drivers/net/phy/realtek/realtek_main.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2606,6 +2606,7 @@ static int rtl826x_probe(struct phy_devi
+ {
+ 	struct device *dev = &phydev->mdio.dev;
+ 	struct rtl826x_priv *priv;
++	int ret;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(struct rtl826x_priv), GFP_KERNEL);
+ 	if (!priv)
