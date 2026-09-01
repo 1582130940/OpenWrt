@@ -1,0 +1,36 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 26 May 2026 04:53:48 +0900
+Subject: [PATCH] net: add flow-aware forward path discovery
+
+Some upper devices select their lower egress device from packet flow
+information, so a destination address alone is not enough to describe
+the same path that the transmit path will use.
+
+Add an optional flow key pointer to net_device_path_ctx. Callers that can
+describe the packet flow fill it in before calling
+dev_fill_forward_path(), so no new path-walking entry point is needed.
+
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/linux/netdevice.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -232,6 +232,7 @@ struct net_device_core_stats {
+ 
+ struct neighbour;
+ struct neigh_parms;
++struct flow_keys;
+ struct sk_buff;
+ 
+ struct netdev_hw_addr {
+@@ -925,6 +926,7 @@ struct net_device_path_stack {
+ 
+ struct net_device_path_ctx {
+ 	const struct net_device *dev;
++	const struct flow_keys	*flow;
+ 	u8			daddr[ETH_ALEN];
+ 
+ 	int			num_vlans;
