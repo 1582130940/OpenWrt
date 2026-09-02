@@ -2,14 +2,28 @@
 # Copyright (C) 2025 OpenWrt.org
 #
 
-[ -e /etc/config/ubootenv ] && exit 0
+. /lib/functions.sh
+
+board=$(board_name)
+
+case "$board" in
+gemtek,w1700k-ubi|\
+nokia,xg-040g-md-ubi)
+	if [ -e /etc/config/ubootenv ] && [ -e /etc/fw_env.config ] &&
+		grep -Eq '^/dev/ubi[0-9]+_[0-9]+[[:space:]]' /etc/fw_env.config; then
+		exit 0
+	fi
+
+	rm -f /etc/config/ubootenv /etc/fw_env.config /etc/fw_sys.config
+	;;
+*)
+	[ -e /etc/config/ubootenv ] && exit 0
+	;;
+esac
 
 touch /etc/config/ubootenv
 
 . /lib/uboot-envtools.sh
-. /lib/functions.sh
-
-board=$(board_name)
 
 case "$board" in
 gemtek,w1700k-ubi|\
