@@ -140,7 +140,10 @@ load_led() {
 					[ -e "/sys/class/leds/${sysfs}/$m" ] && \
 						echo 1 > "/sys/class/leds/${sysfs}/$m"
 				done
-				echo $interval > "/sys/class/leds/${sysfs}/interval" 2>/dev/null
+				if [ ! -e "/sys/class/leds/${sysfs}/offloaded" ] ||
+				   [ "$(cat /sys/class/leds/${sysfs}/offloaded)" != 1 ]; then
+					echo $interval > /sys/class/leds/${sysfs}/interval 2>/dev/null
+				fi
 			}
 			;;
 
