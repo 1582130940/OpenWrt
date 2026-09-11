@@ -28,11 +28,11 @@ boot()
 		echo 1 > $hwmon/pwm1_enable
 
 		# Match trigger points from vendor firmware
-		echo 40000 > $hwmon/pwm1_auto_point1_temp
-		echo 50000 > $hwmon/pwm1_auto_point2_temp
-		echo 60000 > $hwmon/pwm1_auto_point3_temp
-		echo 70000 > $hwmon/pwm1_auto_point4_temp
-		echo 80000 > $hwmon/pwm1_auto_point5_temp
+		echo 35000 > $hwmon/pwm1_auto_point1_temp
+		echo 45000 > $hwmon/pwm1_auto_point2_temp
+		echo 55000 > $hwmon/pwm1_auto_point3_temp
+		echo 65000 > $hwmon/pwm1_auto_point4_temp
+		echo 75000 > $hwmon/pwm1_auto_point5_temp
 
 		# Match fan speed from vendor firmware
 		echo 54  > $hwmon/pwm1_auto_point1_pwm
