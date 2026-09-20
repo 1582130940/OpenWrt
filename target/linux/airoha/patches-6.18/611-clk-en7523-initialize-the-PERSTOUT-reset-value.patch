@@ -1,0 +1,25 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 00:35:43 +0900
+Subject: [PATCH] clk: en7523: initialize the PERSTOUT reset value
+
+Both branches OR into an uninitialized local, so the asserted value
+depends on stack contents: a stray bit in the register window makes
+en7523_reset_update() write the opposite polarity for the dedicated
+PERSTOUT resets. Assign the masked value directly.
+
+Signed-off-by: ACK72 <ACK72@users.noreply.github.com>
+---
+--- a/drivers/clk/clk-en7523.c
++++ b/drivers/clk/clk-en7523.c
+@@ -1068,9 +1068,9 @@
+ 
+ 	/* For PCIC reset logic is inverted, 0:assert 1:deassert*/
+ 	if (addr == REG_NP_SCU_PCIC)
+-		val |= assert ? 0 : BIT(id % RST_NR_PER_BANK);
++		val = assert ? 0 : BIT(id % RST_NR_PER_BANK);
+ 	else
+-		val |= assert ? BIT(id % RST_NR_PER_BANK) : 0;
++		val = assert ? BIT(id % RST_NR_PER_BANK) : 0;
+ 
+ 	regmap_update_bits(rst_data->map, addr, BIT(id % RST_NR_PER_BANK),
+ 			   val);
