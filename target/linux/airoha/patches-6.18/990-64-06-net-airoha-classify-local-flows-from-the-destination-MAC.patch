@@ -1,0 +1,86 @@
+From: naoki66 <naoki66@qq.com>
+Subject: [PATCH] net: airoha: classify local flows from the destination MAC
+
+The bridge fallback only refused frames addressed to the bridge master.
+A frame whose destination is the ingress interface's own MAC address
+still reached airoha_ppe_foe_prepare_bridge_subflow(), and the L2 flow
+table lookup below it had no host-destined exclusion at all, so a stray
+FDB or PPE classification could bind management traffic into hardware.
+
+Read the destination MAC once per unbind event, treat an incompletely
+initialised skb as local, and refuse the bridge fallback and the L2
+binding for local frames.
+
+Signed-off-by: naoki66 <naoki66@qq.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 43 +++++++++++++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1250,6 +1250,32 @@
+ 	}
+ }
+ 
++static bool airoha_ppe_foe_skb_is_local(const struct sk_buff *skb)
++{
++	struct net_device *master;
++	const struct ethhdr *eh;
++	bool local;
++
++	/* The NPU/WED RX paths run the PPE check before eth_type_trans(), so
++	 * treat an incompletely initialised skb as local rather than letting
++	 * it enable the bridge fallback.
++	 */
++	if (!skb->dev || !skb_mac_header_was_set(skb))
++		return true;
++
++	eh = eth_hdr(skb);
++	if (ether_addr_equal_64bits(eh->h_dest, skb->dev->dev_addr))
++		return true;
++
++	rcu_read_lock();
++	master = airoha_ppe_foe_get_bridge_master_rcu(skb->dev);
++	local = master &&
++		ether_addr_equal_64bits(eh->h_dest, master->dev_addr);
++	rcu_read_unlock();
++
++	return local;
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan)
+@@ -1262,13 +1288,16 @@
+ 	u8 bridge_addr[ETH_ALEN] = {};
+ 	bool commit_done = false;
+ 	bool bridge_ready = false;
++	bool local;
+ 	struct hlist_node *n;
+ 	u32 index, state;
+ 
+-	bridge_ready = airoha_ppe_foe_prepare_bridge_subflow(ppe, skb,
+-							     &bridge_hwe,
+-							     &bridge_dev,
+-							     bridge_addr);
++	local = airoha_ppe_foe_skb_is_local(skb);
++	if (!local)
++		bridge_ready = airoha_ppe_foe_prepare_bridge_subflow(ppe, skb,
++								     &bridge_hwe,
++								     &bridge_dev,
++								     bridge_addr);
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 
+@@ -1307,6 +1336,12 @@
+ 	if (commit_done)
+ 		goto unlock;
+ 
++	/* Management traffic addressed to the router itself must stay in the
++	 * software path: binding it to a hardware egress black-holes it.
++	 */
++	if (local)
++		goto unlock;
++
+ 	if (!airoha_ppe_foe_entry_match_skb(hwe, skb)) {
+ 		pr_debug_ratelimited("airoha_ppe: skip bridge bind at hash %04x (tuple mismatch)\n",
+ 				     hash);
