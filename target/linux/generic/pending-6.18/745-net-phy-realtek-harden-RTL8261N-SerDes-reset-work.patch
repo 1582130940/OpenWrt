@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: naoki66 <naoki66@qq.com>
+Date: Tue, 30 Sep 2026 00:00:00 +0000
+Subject: [PATCH] net: phy: realtek: harden RTL8261N SerDes reset work against races
+
+The RTL8261N USXGMII bring-up work pulses the SerDes reset from a delayed
+work item, while rtl826x_link_change_notify() disables that work when the
+PHY leaves the running state. A work item which has already started still
+runs to completion, so a PHY teardown can be followed by an old reset
+pulse.
+
+Check the disable flag before every register access and before requeueing
+the work, and publish it before the work is disabled so the flag cannot be
+reordered with the register writes.
+
+Signed-off-by: naoki66 <naoki66@qq.com>
+---
+ drivers/net/phy/realtek/realtek_main.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -3289,6 +3289,10 @@ static void rtl826x_sds_reset_work(struct work_struct *work)
+ 	struct phy_device *phydev = priv->phydev;
+ 	int val;
+ 
++	/* link_change_notify() may race with an already-running work. */
++	if (READ_ONCE(priv->sds_work_disabled))
++		return;
++
+ 	val = rtl826x_phy_patch_sds_get(phydev, RTL826X_SDS_PAGE_LINK,
+ 					RTL826X_SDS_REG_LINK);
+ 	if (val < 0)
+@@ -3302,11 +3306,17 @@ static void rtl826x_sds_reset_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	if (READ_ONCE(priv->sds_work_disabled))
++		return;
++
+ 	rtl826x_phy_patch_sds_set(phydev, RTL826X_SDS_PAGE_RESET,
+ 				  RTL826X_SDS_REG_RESET, RTL826X_SDS_RESET_ASSERT);
+ 	rtl826x_phy_patch_sds_set(phydev, RTL826X_SDS_PAGE_RESET,
+ 				  RTL826X_SDS_REG_RESET, RTL826X_SDS_RESET_RELEASE);
+ 
++	if (READ_ONCE(priv->sds_work_disabled))
++		return;
++
+ 	schedule_delayed_work(&priv->sds_work,
+ 			      msecs_to_jiffies(RTL826X_SDS_POLL_MS));
+ }
+@@ -3316,16 +3326,16 @@ static void rtl826x_link_change_notify(struct phy_device *phydev)
+ 	struct rtl826x_priv *priv = phydev->priv;
+ 
+ 	if (phydev->state != PHY_RUNNING) {
+-		if (!priv->sds_work_disabled) {
++		if (!READ_ONCE(priv->sds_work_disabled)) {
++			WRITE_ONCE(priv->sds_work_disabled, true);
+ 			disable_delayed_work(&priv->sds_work);
+-			priv->sds_work_disabled = true;
+ 		}
+ 		return;
+ 	}
+ 
+-	if (priv->sds_work_disabled) {
++	if (READ_ONCE(priv->sds_work_disabled)) {
+ 		enable_delayed_work(&priv->sds_work);
+-		priv->sds_work_disabled = false;
++		WRITE_ONCE(priv->sds_work_disabled, false);
+ 	}
+ 
+ 	priv->sds_retries = 0;
