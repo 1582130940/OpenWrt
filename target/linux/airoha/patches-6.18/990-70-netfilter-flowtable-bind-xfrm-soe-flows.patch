@@ -220,7 +220,7 @@ diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_pa
  #include <net/netfilter/nf_tables.h>
  #include <net/netfilter/nf_tables_core.h>
  #include <net/netfilter/nf_conntrack_core.h>
-@@ -44,9 +45,24 @@
+@@ -44,9 +45,24 @@ static void nft_flow_set_dscp(const struct nft_pktinfo *pkt,
  
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {
@@ -247,18 +247,18 @@ diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_pa
  	if (family == NFPROTO_IPV4) {
  		const struct ip_options *opt;
  
-@@ -78,6 +94,7 @@
+@@ -78,6 +94,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  	struct nf_flow_route route = {};
  	enum ip_conntrack_info ctinfo;
  	struct flow_offload *flow;
 +	bool tcp_not_established = false;
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
- 	int ret;
-@@ -93,9 +110,14 @@
- 	case IPPROTO_TCP:
- 		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
- 					  sizeof(_tcph), &_tcph);
+ 	int ret, thoff;
+@@ -96,9 +113,14 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 			goto out;
+ 		tcph = skb_header_pointer(pkt->skb, thoff, sizeof(_tcph),
+ 					  &_tcph);
 -		if (unlikely(!tcph || tcph->fin || tcph->rst ||
 -			     !nf_conntrack_tcp_established(ct)))
 +		if (unlikely(!tcph))
@@ -272,7 +272,7 @@ diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_pa
  		break;
  	case IPPROTO_UDP:
  		break;
-@@ -130,6 +152,16 @@
+@@ -133,6 +155,16 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
  		goto err_flow_route;
  
