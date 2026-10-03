@@ -1,0 +1,41 @@
+From: dsanke <dsanke1997@gmail.com>
+Date: Sat, 3 Oct 2026 21:25:59 +0800
+Subject: [PATCH] hostapd: cap DFS CAC wait for lab builds
+
+Cap the DFS CAC wait at 10 seconds instead of the regulatory 60 seconds
+so radar channels become usable quickly in development builds. Pairs
+with the mac80211-side lab CAC/NOP hack already carried by this tree.
+
+Signed-off-by: dsanke <dsanke1997@gmail.com>
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -822,6 +822,10 @@
+ }
+ 
+ 
++/* Laboratory/development builds cap the DFS CAC wait at 10 s instead of
++ * the regulatory 60 s so radar channels become usable quickly. */
++#define DFS_CAC_LAB_MAX_MS 10000
++
+ static unsigned int dfs_get_cac_time(struct hostapd_iface *iface,
+ 				     int start_chan_idx, int n_chans)
+ {
+@@ -842,6 +846,9 @@
+ 			cac_time_ms = channel->dfs_cac_ms;
+ 	}
+ 
++	if (cac_time_ms > DFS_CAC_LAB_MAX_MS)
++		cac_time_ms = DFS_CAC_LAB_MAX_MS;
++
+ 	return cac_time_ms;
+ }
+ 
+@@ -1671,7 +1678,7 @@
+ 			ieee802_11_set_beacons(iface);
+ 	}
+ 	/* TODO: How to check CAC time for ETSI weather channels? */
+-	iface->dfs_cac_ms = 60000;
++	iface->dfs_cac_ms = DFS_CAC_LAB_MAX_MS;
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, DFS_EVENT_CAC_START
+ 		"freq=%d chan=%d chan_offset=%d width=%d seg0=%d "
+ 		"seg1=%d cac_time=%ds%s",
