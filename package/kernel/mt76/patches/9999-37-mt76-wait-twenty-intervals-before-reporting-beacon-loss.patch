@@ -1,0 +1,29 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Sun, 4 Oct 2026 17:15:00 +0900
+Subject: [PATCH] wifi: mt76: wait twenty intervals before reporting beacon loss
+
+The STA beacon monitor reported beacon loss after seven missed intervals,
+about 0.77 s with HZ=100. mac80211 then sends two nullfunc frames back to
+back and disconnects locally if neither is acknowledged.
+
+APs can skip beacons for more than a second while off channel and keep
+serving the station, so those gaps cost a reconnect and several seconds of
+outage. Wait twenty intervals, about 2.2 s at 100 TU, which is close to the
+limit other clients apply. Losing the AP is still detected, about 1.4 s
+later.
+
+Signed-off-by: ACK72 <acikom72@gmail.com>
+---
+diff --git a/mt76.h b/mt76.h
+index 2739552f..8b0cf4ab 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -376,7 +376,7 @@ enum mt76_wcid_flags {
+ };
+ 
+ #define MT76_N_WCIDS 1088
+-#define MT76_BEACON_MON_MAX_MISS	7
++#define MT76_BEACON_MON_MAX_MISS	20
+ 
+ /* stored in ieee80211_tx_info::hw_queue */
+ #define MT_TX_HW_QUEUE_PHY		GENMASK(3, 2)
