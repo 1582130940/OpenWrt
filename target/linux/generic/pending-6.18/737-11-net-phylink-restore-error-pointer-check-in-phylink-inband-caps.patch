@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: naoki66 <naoki66@qq.com>
+Date: Thu, 8 Oct 2026 15:51:38 +0800
+Subject: [PATCH] net: phylink: restore the error-pointer check in phylink_inband_caps
+
+The internal PCS handling replaced the pristine IS_ERR_OR_NULL() check
+with a plain non-NULL test, so an ERR_PTR() returned by .mac_select_pcs
+is treated as a found PCS and dereferenced by phylink_pcs_inband_caps().
+
+Restore the error check while keeping the upstream structure.
+
+Adapted from ImmortalWrt-for-Gemtek-brightspeed commit 3fc77f2632.
+
+Signed-off-by: naoki66 <naoki66@qq.com>
+---
+ drivers/net/phy/phylink.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -1020,7 +1020,7 @@
+ 	if (pl->mac_ops->mac_select_pcs) {
+ 		pcs = pl->mac_ops->mac_select_pcs(pl->config,
+ 						  interface);
+-		pcs_found = !!pcs;
++		pcs_found = !IS_ERR_OR_NULL(pcs);
+ 	} else if (test_bit(interface, pl->config->pcs_interfaces)) {
+ 		list_for_each_entry(pcs, &pl->pcs_list, list) {
+ 			if (!phylink_validate_pcs_interface(pcs, interface)) {
