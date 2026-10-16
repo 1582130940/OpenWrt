@@ -9,12 +9,52 @@ nokia_initial_setup()
 	fw_setenv bootcmd "flash read 0xc0000 0x800000 0x85000000; bootm 0x85000000"
 }
 
+airoha_require_ubi_volumes()
+{
+	local ubidev volume
+
+	ubidev="$(nand_find_ubi ubi)"
+	[ -n "$ubidev" ] || {
+		echo "UBI is not initialized; create the base volumes from U-Boot recovery."
+		return 1
+	}
+
+	for volume in "$@"; do
+		nand_find_volume "$ubidev" "$volume" >/dev/null || {
+			echo "UBI base volume $volume is missing; repair the layout from U-Boot recovery."
+			return 1
+		}
+	done
+}
+
 platform_check_image() {
 	local board=$(board_name)
 
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
+	gemtek,w1700k-ubi)
+		# A clean UBI installation does not persist OpenWrt's generic
+		# compat_version marker. Decide upgrade safety from the real flash
+		# layout instead. Old BMT/BBT layouts are never written.
+		w1700k_mtd_size_is() {
+			awk -v label="$1" -v expected="$2" '
+				$4 == "\"" label "\"" && tolower($2) == expected { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' /proc/mtd 2>/dev/null
+		}
+		if ! w1700k_mtd_size_is vendor 00600000 || \
+		   ! w1700k_mtd_size_is chainloader 00100000 || \
+		   ! w1700k_mtd_size_is ubi 1b700000 || \
+		   ! w1700k_mtd_size_is reserved_bmt 04200000; then
+			echo "W1700K UBI 2.0 boundaries are not active; refusing normal sysupgrade." >&2
+			echo "Install the corrected chainloader/U-Boot and recreate UBI through recovery first." >&2
+			return 1
+		fi
+		airoha_require_ubi_volumes ubootenv ubootenv2 fit || return 1
+		fit_check_image "$1"
+		return $?
+		;;
 	nokia,xg-040g-md)
 		nand_do_platform_check "$board" "$1"
 		return $?
