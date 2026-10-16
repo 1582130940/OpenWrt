@@ -7,7 +7,14 @@
 board=$(board_name)
 
 case "$board" in
-gemtek,w1700k-ubi|\
+gemtek,w1700k-ubi)
+	if [ -e /etc/config/ubootenv ] && [ -e /etc/fw_env.config ] &&
+		[ "$(grep -Ec '^/dev/ubi[0-9]+_[0-9]+[[:space:]]+0x0[[:space:]]+0x4000[[:space:]]+0x1f000[[:space:]]+1$' /etc/fw_env.config)" -eq 2 ]; then
+		exit 0
+	fi
+
+	rm -f /etc/config/ubootenv /etc/fw_env.config /etc/fw_sys.config
+	;;
 nokia,xg-040g-md-ubi)
 	if [ -e /etc/config/ubootenv ] && [ -e /etc/fw_env.config ] &&
 		grep -Eq '^/dev/ubi[0-9]+_[0-9]+[[:space:]]' /etc/fw_env.config; then
@@ -25,8 +32,32 @@ touch /etc/config/ubootenv
 
 . /lib/uboot-envtools.sh
 
+# The W1700K chainloader U-Boot keeps CONFIG_ENV_SIZE=0x4000 for its
+# redundant UBI environment. The generic 0x1f000 layout makes fw_setenv
+# write an environment whose CRC the U-Boot rejects, so bootcmd changes
+# never take effect.
+ubootenv_add_ubi_w1700k() {
+	. /lib/upgrade/nand.sh
+	local envubi=$(nand_find_ubi ubi)
+	local envvol envvol2 envdev envdev2
+
+	[ -n "$envubi" ] || return 0
+
+	envvol="$(nand_find_volume $envubi ubootenv)"
+	envvol2="$(nand_find_volume $envubi ubootenv2)"
+	[ -n "$envvol" ] || return 0
+	[ -n "$envvol2" ] || return 0
+
+	envdev="/dev/$envvol"
+	envdev2="/dev/$envvol2"
+	ubootenv_add_uci_config "$envdev" "0x0" "0x4000" "0x1f000" "1"
+	ubootenv_add_uci_config "$envdev2" "0x0" "0x4000" "0x1f000" "1"
+}
+
 case "$board" in
-gemtek,w1700k-ubi|\
+gemtek,w1700k-ubi)
+	ubootenv_add_ubi_w1700k
+	;;
 nokia,xg-040g-md-ubi)
 	ubootenv_add_ubi_default
 	;;
