@@ -1,0 +1,26 @@
+From: kaiwater <kaiwater@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:50:00 +0800
+Subject: [PATCH] wifi: mt76: mt7996: advertise beacon protection support
+
+The driver already installs a BIGTK with GENERATE_MMIE, maps the BIP
+cipher and arms firmware with a beacon remove/re-add cycle, but never
+advertises NL80211_EXT_FEATURE_BEACON_PROTECTION. hostapd therefore treats
+beacon protection as unsupported, clears beacon_prot and never negotiates
+a BIGTK.
+
+Advertise the feature so the existing implementation becomes reachable.
+
+Signed-off-by: kaiwater <kaiwater@users.noreply.github.com>
+---
+diff --git a/mt7996/init.c b/mt7996/init.c
+index d6a27146..21ef90fb 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -528,6 +528,7 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
++	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_BEACON_PROTECTION);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_PUNCT);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SCS);
