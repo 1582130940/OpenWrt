@@ -1,0 +1,25 @@
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +0800
+Subject: [PATCH] net: dsa: mt7530: trap frames to the conduit on EN7581 and AN7583
+
+Frames trapped by the switch only reach the CPU when MT7530_CPU_EN and
+MT7530_CPU_PORT are set in MT753X_MFC. EN7581 and AN7583 only set the CPU
+port bitmap in MT7531_CFC and are skipped by mt753x_conduit_state_change(),
+so BPDUs and LLDP frames from switch user ports are dropped.
+
+Program the MFC CPU port bits for both SoCs as well.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -3333,7 +3333,8 @@
+ 	 * interface is up.
+ 	 */
+ 	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
+-	    priv->id != ID_EN7528)
++	    priv->id != ID_EN7528 && priv->id != ID_EN7581 &&
++	    priv->id != ID_AN7583)
+ 		return;
+ 
+ 	mask = BIT(cpu_dp->index);
