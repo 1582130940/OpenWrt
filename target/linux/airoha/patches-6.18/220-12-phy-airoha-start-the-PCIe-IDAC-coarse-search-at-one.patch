@@ -1,0 +1,30 @@
+From: naoki66 <naoki66@qq.com>
+Date: Wed, 11 Nov 2026 00:00:00 +0800
+Subject: [PATCH] phy: airoha: start the PCIe IDAC coarse search at one
+
+The vendor calibration walks the CDR PR IDAC code from 1 to
+LEQ_LEN_CTRL_MAX_VAL; code 0 is not a valid force value and only adds a
+sample that never locks. Start both lane searches at one.
+
+Signed-off-by: naoki66 <naoki66@qq.com>
+---
+--- a/drivers/phy/airoha/phy-airoha-pcie.c
++++ b/drivers/phy/airoha/phy-airoha-pcie.c
+@@ -162,7 +162,7 @@
+ 				 REG_PCIE_PMA_FORCE_DA_PXP_CDR_PR_PIEYE_PWDB,
+ 				 PCIE_FORCE_DA_PXP_CDR_PR_PWDB);
+ 
+-	for (i = 0; i < LEQ_LEN_CTRL_MAX_VAL; i++) {
++	for (i = 1; i <= LEQ_LEN_CTRL_MAX_VAL; i++) {
+ 		airoha_phy_pma0_update_field(pcie_phy,
+ 				REG_PCIE_PMA_FORCE_DA_PXP_CDR_PR_IDAC,
+ 				PCIE_FORCE_DA_PXP_CDR_PR_IDAC, i << 8);
+@@ -322,7 +322,7 @@
+ 				 REG_PCIE_PMA_FORCE_DA_PXP_CDR_PR_PIEYE_PWDB,
+ 				 PCIE_FORCE_DA_PXP_CDR_PR_PWDB);
+ 
+-	for (i = 0; i < LEQ_LEN_CTRL_MAX_VAL; i++) {
++	for (i = 1; i <= LEQ_LEN_CTRL_MAX_VAL; i++) {
+ 		airoha_phy_pma1_update_field(pcie_phy,
+ 				REG_PCIE_PMA_FORCE_DA_PXP_CDR_PR_IDAC,
+ 				PCIE_FORCE_DA_PXP_CDR_PR_IDAC, i << 8);
