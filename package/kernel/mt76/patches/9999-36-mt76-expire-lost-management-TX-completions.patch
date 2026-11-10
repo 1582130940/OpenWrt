@@ -1,0 +1,124 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Tue, 10 Nov 2026 21:30:00 +0900
+Subject: [PATCH] wifi: mt76: expire management TX completions that never arrive
+
+__mt76_set_channel() waits up to HZ/5 for the per-PHY count of PSD tokens
+before switching channel. A token whose TX-free record never arrives keeps
+that count above zero until the next device reset, so every later channel
+switch of the PHY waits the full timeout with the device-wide TX worker
+parked and host TX stopped on every band.
+
+Firmware sends PSD frames right away, so their TX-free record is lost if
+it has not arrived after two seconds. Drop such a token from the pending
+count while keeping the token and its buffers allocated, so a late record
+still releases them.
+
+Signed-off-by: ACK72 <acikom72@gmail.com>
+---
+diff --git a/mac80211.c b/mac80211.c
+index 2fd16ffd..9138e2f7 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1157,6 +1157,7 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
+ 	mt76_txq_schedule_pending(phy);
+ 
+ 	set_bit(MT76_RESET, &phy->state);
++	mt76_mgmt_tx_expire(phy);
+ 	wait_event_timeout(dev->tx_wait, !mt76_has_tx_pending(phy), timeout);
+ 	mt76_update_survey(phy);
+ 
+diff --git a/mt76.h b/mt76.h
+index 997683a1..2739552f 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -465,6 +465,10 @@ struct mt76_txwi_cache {
+ 
+ 	u8 qid;
+ 	u8 phy_idx;
++
++	/* PSD token counted in mgmt_tx_pending; written under token_lock */
++	bool mgmt_counted;
++	unsigned long consumed;
+ };
+ 
+ struct mt76_rx_tid {
+@@ -1600,6 +1604,7 @@ void mt76_release_buffered_frames(struct ieee80211_hw *hw,
+ void mt76_sta_ps_transition(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 			    bool ps);
+ bool mt76_has_tx_pending(struct mt76_phy *phy);
++void mt76_mgmt_tx_expire(struct mt76_phy *phy);
+ int mt76_update_channel(struct mt76_phy *phy);
+ void mt76_update_survey(struct mt76_phy *phy);
+ void mt76_phy_chandef_set(struct mt76_phy *phy,
+diff --git a/tx.c b/tx.c
+index f7404203..5cc1e4ac 100644
+--- a/tx.c
++++ b/tx.c
+@@ -1038,7 +1038,9 @@ int mt76_token_consume(struct mt76_dev *dev, struct mt76_txwi_cache **ptxwi)
+ 	if (token >= dev->token_start) {
+ 		dev->token_count++;
+ 
+-		if ((*ptxwi)->qid == MT_TXQ_PSD) {
++		(*ptxwi)->mgmt_counted = (*ptxwi)->qid == MT_TXQ_PSD;
++		(*ptxwi)->consumed = jiffies;
++		if ((*ptxwi)->mgmt_counted) {
+ 			struct mt76_phy *mphy = mt76_dev_phy(dev, (*ptxwi)->phy_idx);
+ 			atomic_inc(&mphy->mgmt_tx_pending);
+ 		}
+@@ -1088,8 +1090,11 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
+ 	if (txwi) {
+ 		dev->token_count--;
+ 
+-		if (txwi->qid == MT_TXQ_PSD) {
++		/* An expired token no longer holds the counter. */
++		if (txwi->mgmt_counted) {
+ 			struct mt76_phy *mphy = mt76_dev_phy(dev, txwi->phy_idx);
++
++			txwi->mgmt_counted = false;
+ 			if (atomic_dec_and_test(&mphy->mgmt_tx_pending))
+ 				wake_up(&dev->tx_wait);
+ 		}
+@@ -1112,6 +1117,43 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
+ }
+ EXPORT_SYMBOL_GPL(mt76_token_release);
+ 
++/* Firmware sends PSD (ALTX) frames right away without powersave buffering, so
++ * their TX-free record arrives well within this time. A token still counted
++ * after that lost its record; left counted, it would make every channel switch
++ * of its PHY wait the full timeout with the TX worker parked.
++ */
++#define MT76_MGMT_TX_STALE	(2 * HZ)
++
++void mt76_mgmt_tx_expire(struct mt76_phy *phy)
++{
++	struct mt76_dev *dev = phy->dev;
++	unsigned long now = jiffies;
++	struct mt76_txwi_cache *txwi;
++	int id, n = 0;
++
++	if (!atomic_read(&phy->mgmt_tx_pending))
++		return;
++
++	spin_lock_bh(&dev->token_lock);
++	idr_for_each_entry(&dev->token, txwi, id) {
++		if (!txwi->mgmt_counted || txwi->phy_idx != phy->band_idx ||
++		    time_before(now, txwi->consumed + MT76_MGMT_TX_STALE))
++			continue;
++
++		/* Keep the token and its buffers: a late TX-free record still
++		 * releases them, it just no longer touches the counter.
++		 */
++		txwi->mgmt_counted = false;
++		atomic_dec(&phy->mgmt_tx_pending);
++		n++;
++	}
++	spin_unlock_bh(&dev->token_lock);
++
++	dev_warn_ratelimited(dev->dev,
++			     "band %u: %d management frame(s) got no TX completion; channel switches no longer wait for them\n",
++			     phy->band_idx, n);
++}
++
+ struct mt76_txwi_cache *
+ mt76_rx_token_release(struct mt76_dev *dev, int token)
+ {
